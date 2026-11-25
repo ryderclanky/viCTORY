@@ -185,7 +185,7 @@ fn bench_indirect_draw_barriers() {
     };
     let device = &host.device;
     let clamps = [
-        make_from(device, OLD_SOURCE).expect("the old clamp"),
+        make_from(device, OLD_SOURCE, 6).expect("the old clamp"),
         make_for(device).expect("the clamp"),
     ];
     // SAFETY: plain D3D12 object creation with valid descriptions; the
@@ -408,6 +408,7 @@ fn bench_indirect_draw_barriers() {
                     None,
                     (0, STEP, records),
                     window > 1,
+                    false,
                 ));
                 state = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
                 list.SetPipelineState(&pso);

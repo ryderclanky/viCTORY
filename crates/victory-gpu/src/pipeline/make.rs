@@ -14,6 +14,29 @@
 //!
 //! The default budget is half a second per title frame. A pass the title
 //! runs only once and whose pipeline takes longer is lost.
+//!
+//! Compiling is also gated on the commit the system has left ([`permit`]).
+//! The run this was added for died inside the driver's compiler: `ptxas
+//! fatal : Memory allocation failure`, `LLVM ERROR: out of memory`, pipeline
+//! creation `0x8007000E`, then the title trapped in its own fatal handler. Its
+//! crash context says why — 645 MiB of commit free, 95 % memory load, a 47.7 GB
+//! page file with 2 GB of it left — with 8 pipelined compiles in flight at once,
+//! one per worker. No single program was too large for the compiler; eight
+//! copies of a compiler that needs hundreds of MiB each were. So the number
+//! compiling at once now follows the commit that is actually free, and collapses
+//! to one when it is short, which is the state that run was in.
+//!
+//! Two kinds of pipeline are not made at all ([`left_out`]): about 1,000
+//! compute programs that shade ray-tracing hits nothing in this
+//! configuration builds, and one whose compile costs 85 s and 1.3 GB of
+//! the driver's memory. Ported from the Neptune edit of VIctory
+//! (AnyXboxX's `third_party/victory`,
+//! `crates/victory-gpu/src/pipeline/make.rs`), with this machine's
+//! defaults rather than that fork's 32 GB / 12 GB ones: on a card of 8 GB
+//! the 1,000 compiles and the 1.3 GB are the difference between loading
+//! and thrashing, so both are left out by default while the structure
+//! builder is off, and `VICTORY_RT_RESOLVE=1` / `VICTORY_ACTIVATE_RAYS=1`
+//! force each in.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -33,6 +56,88 @@ pub(crate) struct Pending {
     /// whether a draw or dispatch has requested it yet.
     key: String,
     used: AtomicBool,
+    /// Why it is not made, if it is not ([`left_out`]).
+    left_out: Option<&'static str>,
+}
+
+/// Why a pipeline with these shaders is not made, if it is not. Counted
+/// per filter, for the line [`report_left_out`] logs when the workers run
+/// out of work: a left-out pipeline never reaches the queue, so nothing
+/// else would report it.
+fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
+    let (filter, why) = if without_structures(shaders) {
+        (0, "shades ray-tracing hits, left out")
+    } else if too_dear(shaders) {
+        (1, "too dear to compile, left out")
+    } else {
+        return None;
+    };
+    LEFT_OUT[filter].fetch_add(1, Ordering::Relaxed);
+    Some(why)
+}
+
+/// Pipelines left out since the last line, by filter (0:
+/// [`without_structures`], 1: [`too_dear`]).
+static LEFT_OUT: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// One line on how many pipelines each filter left out since the last
+/// line. The title binds the programs it left out in batches (the ~1,000
+/// `CS_RaytracingResolve` programs at the world's first frame, each 5 to
+/// 9 s of the driver's compile not spent), so a batch's count is the
+/// whole of them.
+fn report_left_out() {
+    let raytracing_resolve = LEFT_OUT[0].swap(0, Ordering::Relaxed);
+    let activate_rays = LEFT_OUT[1].swap(0, Ordering::Relaxed);
+    if raytracing_resolve > 0 || activate_rays > 0 {
+        tracing::info!(
+            raytracing_resolve,
+            activate_rays,
+            "host pipelines left out: their programs shade ray-tracing structures this run does not build"
+        );
+    }
+}
+
+/// Whether some compute shader of `shaders` holds `name`.
+fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
+    shaders.iter().any(|s| s.stage == "compute" && s.holds(name))
+}
+
+/// Whether a pipeline only shades what the console's ray-tracing structures
+/// were hit by: about 1,000 compute programs of the title
+/// (`CS_RaytracingResolve`, the `raytracingresolve_dispatch` pass of each
+/// material), all bound at the world's first frame, each 5 to 9 s of the
+/// host driver's compile. They stand in the queue before the passes that
+/// make the picture, and with the structure builder off there is no hit to
+/// shade: what they write is garbage.
+///
+/// The sibling fork made them by default and left them out with
+/// `VICTORY_RT_RESOLVE=0`; here they are left out by default while the
+/// builder is off (`VICTORY_BVH_BUILDER` unset), because on a card of 8 GB
+/// the 1,000 compiles are the difference between loading and thrashing,
+/// and `VICTORY_RT_RESOLVE=1` makes them as before. With the builder on
+/// they shade what reflections and indirect light hit, and are always made.
+fn without_structures(shaders: &[Arc<Shader>]) -> bool {
+    static OUT: OnceLock<bool> = OnceLock::new();
+    let out = *OUT.get_or_init(|| {
+        let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
+        let forced = std::env::var_os("VICTORY_RT_RESOLVE").is_some_and(|v| v == "1");
+        !forced && !builder
+    });
+    out && named(shaders, b"CS_RaytracingResolve")
+}
+
+/// Whether a pipeline is left out for what it costs the host's driver:
+/// `CS_ScreenProbes_ActivateRays` of the title (66,501 instructions,
+/// 9,948 branches), 85 s of the driver's compile and 1.3 GB of its memory
+/// once, whose output feeds ray-traced probe light this run does not use.
+///
+/// The sibling fork made it by default and left it out with
+/// `VICTORY_ACTIVATE_RAYS=0`; here it is left out by default for that
+/// 1.3 GB, and `VICTORY_ACTIVATE_RAYS=1` makes it as before.
+fn too_dear(shaders: &[Arc<Shader>]) -> bool {
+    static OUT: OnceLock<bool> = OnceLock::new();
+    let out = *OUT.get_or_init(|| !std::env::var_os("VICTORY_ACTIVATE_RAYS").is_some_and(|v| v == "1"));
+    out && named(shaders, b"CS_ScreenProbes_ActivateRays")
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -49,6 +154,7 @@ impl Pending {
             key.update(s.hash.as_bytes());
         }
         key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
+        let left_out = left_out(&shaders);
         Pending {
             shaders,
             graphics,
@@ -56,12 +162,19 @@ impl Pending {
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
+            left_out,
         }
     }
 
     fn make(&self) {
-        self.made
-            .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+        self.made.get_or_init(|| {
+            // The permit is taken here rather than in the worker loop, because
+            // this is the call into the driver's compiler: `now` reaches it from
+            // the title's own thread as well, and a second thread's `get_or_init`
+            // waits on the first compile instead of taking a permit of its own.
+            let _permit = permit();
+            HostPipeline::new(&self.shaders, self.graphics.as_deref())
+        });
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
@@ -74,7 +187,7 @@ impl Pending {
 pub(crate) fn missing(p: &Pending) -> Option<String> {
     match p.made.get() {
         Some(Some(_)) => None,
-        None => Some("being made".into()),
+        None => Some(p.left_out.unwrap_or("being made").to_owned()),
         Some(None) => {
             let failed: Vec<String> = p
                 .shaders
@@ -118,6 +231,9 @@ pub(crate) fn waiting() -> u64 {
 /// The host pipeline if it is made (or is made within the frame's budget);
 /// queues it on first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
+    if p.left_out.is_some() {
+        return None;
+    }
     // A still-pending pipeline was requested by the title too. Prewarm it
     // on the next launch, even if this run never got to use it.
     if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
@@ -133,6 +249,9 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
 /// that is making it); whether it has a host pipeline.
 pub(crate) fn now(p: &Arc<Pending>) -> bool {
+    if p.left_out.is_some() {
+        return false;
+    }
     p.make();
     p.made.get().is_some_and(|made| made.is_some())
 }
@@ -140,7 +259,7 @@ pub(crate) fn now(p: &Arc<Pending>) -> bool {
 /// At the title's creation of a pipeline: starts it at once if an earlier
 /// run drew with it (during loading, so the world's first frames find it).
 pub(crate) fn early(p: &Arc<Pending>) {
-    if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
+    if p.left_out.is_none() && !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
         start(p, EARLY);
     }
@@ -298,8 +417,7 @@ fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
         let mut running = false;
-        let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
-        for i in 0..workers {
+        for i in 0..worker_count() {
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
                 .spawn(|| {
@@ -331,8 +449,126 @@ fn workers() -> bool {
 /// The most pipelines waiting at once since the workers last ran out.
 static PEAK: AtomicU64 = AtomicU64::new(0);
 
-/// The workers ran out of work: logged after a batch of 10 or more, and
-/// the cache saved (at most every 20 s).
+/// The worker threads this pool runs, and the most compiles that can ever be at
+/// once: half the logical processors, 2 to 8.
+fn worker_count() -> usize {
+    static COUNT: OnceLock<usize> = OnceLock::new();
+    *COUNT.get_or_init(|| {
+        std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8))
+    })
+}
+
+/// The commit one driver compile is assumed to need, in bytes: 1 GiB.
+///
+/// Nothing in the crash log records what a compile peaks at (it has no
+/// process-memory line at all), so this is an estimate from the largest
+/// program's size: `CS_ScreenProbes_ActivateRays`, 66,501 instructions, took
+/// 1.3 GB of the driver's memory ([`too_dear`]), which is about 20 KiB an
+/// instruction there. Rounded to 16 KiB an instruction at that program's size,
+/// it is 1 GiB. `shortcut:` the estimate is one number for every program, so
+/// the small ones are gated as if they were large: on this machine that is the
+/// safe direction, and it costs throughput only while commit is short.
+const COMPILE_BYTES: u64 = 1 << 30;
+
+/// Compiles running now, against the permits [`permit`] hands out.
+static COMPILING: Mutex<usize> = Mutex::new(0);
+
+/// Signalled when a compile ends and its permit is free again. A second signal
+/// beside the queue's [`AVAILABLE`], because waiting on the queue's own lock
+/// would hold it against `start`.
+static FREED: Condvar = Condvar::new();
+
+/// A compile's permit: released when dropped.
+struct Permit;
+
+impl Drop for Permit {
+    fn drop(&mut self) {
+        let mut running = COMPILING.lock().unwrap_or_else(|e| e.into_inner());
+        *running -= 1;
+        // The limit can have shrunk since the waiter read it, so every waiter
+        // re-reads it rather than the next one in line taking this permit.
+        FREED.notify_all();
+    }
+}
+
+/// Permission to call the driver's compiler, waiting until the commit that is
+/// free allows one more compile.
+///
+/// The queue has already claimed the job by the time a worker gets here, and
+/// this waits on [`FREED`] without the queue's lock, so a worker held up here
+/// neither reorders the queue's claims nor stops the title's draws from queueing
+/// behind them.
+fn permit() -> Permit {
+    let mut running = COMPILING.lock().unwrap_or_else(|e| e.into_inner());
+    loop {
+        let free = crate::tuning::commit_free();
+        let limit = permits(free, worker_count(), pinned());
+        report_gate(limit, free);
+        if *running < limit {
+            *running += 1;
+            return Permit;
+        }
+        running = FREED.wait(running).unwrap_or_else(|e| e.into_inner());
+    }
+}
+
+/// How many compiles may run at once: `VICTORY_COMPILE_CONCURRENCY` outright,
+/// else the free commit divided by [`COMPILE_BYTES`]. Never fewer than one (a
+/// gate of zero could not let the queue drain), never more than the workers.
+fn permits(free_commit: Option<u64>, workers: usize, pinned: Option<usize>) -> usize {
+    let permits = match (pinned, free_commit) {
+        (Some(n), _) => n,
+        // Nothing read (not Windows, or the call failed): ungated, as every
+        // default here is where nothing is known.
+        (None, None) => workers,
+        (None, Some(bytes)) => (bytes / COMPILE_BYTES).min(workers as u64) as usize,
+    };
+    permits.clamp(1, workers.max(1))
+}
+
+/// `VICTORY_COMPILE_CONCURRENCY=<n>`: the number of compiles at once, outright,
+/// whatever the commit reading says. Read once, and logged once when it is in
+/// effect; unset (or not a positive number) leaves the estimate to decide.
+fn pinned() -> Option<usize> {
+    static PINNED: OnceLock<Option<usize>> = OnceLock::new();
+    *PINNED.get_or_init(|| {
+        let n = std::env::var("VICTORY_COMPILE_CONCURRENCY")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|n| *n > 0);
+        if let Some(n) = n {
+            tracing::info!(
+                permits = n,
+                "pipeline compiles at once pinned by VICTORY_COMPILE_CONCURRENCY, whatever the commit reading says"
+            );
+        }
+        n
+    })
+}
+
+/// One line, at the gate's first permit, on what the estimate gave and what the
+/// system had left then. Not logged when the switch decided the number: it has
+/// its own line, and this one would be about it.
+fn report_gate(limit: usize, free: Option<u64>) {
+    static ONCE: OnceLock<()> = OnceLock::new();
+    if pinned().is_some() {
+        return;
+    }
+    let Some(bytes) = free else { return };
+    ONCE.get_or_init(|| {
+        tracing::info!(
+            permits = limit,
+            free_commit = bytes,
+            workers = worker_count(),
+            estimate_bytes = COMPILE_BYTES,
+            "pipeline compiles are gated on the commit that is free (VICTORY_COMPILE_CONCURRENCY pins the count)"
+        );
+    });
+}
+
+/// The workers ran out of work: logged after a batch of 10 or more, the
+/// pipelines the filters left out, and the cache saved (at most every
+/// 20 s).
 fn drained() {
     use super::library::{EARLY, LOADED, MADE};
     if PEAK.swap(0, Ordering::Relaxed) >= 10 {
@@ -343,12 +579,38 @@ fn drained() {
             "host pipelines all made"
         );
     }
+    report_left_out();
     super::library::save(false);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The permit count follows the commit that is free: one GiB a compile,
+    /// never zero, never more than the workers, and the switch overrides it.
+    #[test]
+    fn permits_follow_the_free_commit_up_to_the_workers() {
+        let gib = 1 << 30;
+        // The crashed run's 645 MiB free commit: one compile at a time.
+        assert_eq!(permits(Some(645 << 20), 8, None), 1);
+        // Nothing free at all is still one: a gate of zero could not drain.
+        assert_eq!(permits(Some(0), 8, None), 1);
+        assert_eq!(permits(Some(2 * gib - 1), 8, None), 1);
+        assert_eq!(permits(Some(2 * gib), 8, None), 2);
+        assert_eq!(permits(Some(5 * gib), 8, None), 5);
+        // More commit than the pool can use is still the pool.
+        assert_eq!(permits(Some(64 * gib), 8, None), 8);
+        assert_eq!(permits(Some(gib), 2, None), 1);
+        // Nothing read: ungated.
+        assert_eq!(permits(None, 8, None), 8);
+        assert_eq!(permits(None, 2, None), 2);
+        // The switch decides outright, whatever the reading says.
+        assert_eq!(permits(Some(64 * gib), 8, Some(1)), 1);
+        assert_eq!(permits(Some(645 << 20), 8, Some(4)), 4);
+        assert_eq!(permits(None, 2, Some(4)), 2, "the pool still caps it");
+        assert_eq!(permits(Some(4 * gib), 8, Some(0)), 1, "zero is still one");
+    }
 
     /// A first use queues the pipeline and, within the budget, gets the
     /// worker's answer (here: no host pipeline for no shaders).
@@ -396,5 +658,36 @@ mod tests {
         assert_eq!(queue.push(&promoted, REQUESTED), None);
         assert!(Arc::ptr_eq(&queue.pop().unwrap(), &earlier));
         assert!(queue.pop().is_none());
+    }
+
+    /// The filters look for the title's programs by name, as its shader
+    /// pack carries them: `CS_RaytracingResolve` (and its variants) and
+    /// `CS_ScreenProbes_ActivateRays`, but not the program that resolves
+    /// the probes' light, `CS_ScreenProbes_TemporalResolve`, whose output
+    /// the run needs (`crate::ambient` reads it).
+    #[test]
+    fn the_filters_match_programs_by_name() {
+        let program = |stage: &'static str, name: &str| {
+            super::super::shader(stage, format!("\u{0}DXIL\u{1}{name}\u{0}").as_bytes())
+        };
+        let matches = |shader: &Arc<Shader>, name: &[u8]| named(std::slice::from_ref(shader), name);
+
+        let resolve = program("compute", "CS_RaytracingResolve");
+        assert!(matches(&resolve, b"CS_RaytracingResolve"));
+        assert!(!matches(&resolve, b"CS_ScreenProbes_ActivateRays"));
+
+        let variant = program("compute", "CS_RaytracingResolve_Dxil");
+        assert!(matches(&variant, b"CS_RaytracingResolve"), "the pack's variants carry the name");
+
+        let rays = program("compute", "CS_ScreenProbes_ActivateRays");
+        assert!(matches(&rays, b"CS_ScreenProbes_ActivateRays"));
+        assert!(!matches(&rays, b"CS_ScreenProbes_TemporalResolve"));
+
+        let temporal = program("compute", "CS_ScreenProbes_TemporalResolve");
+        assert!(!matches(&temporal, b"CS_ScreenProbes_ActivateRays"), "a name is not another's prefix");
+        assert!(!matches(&temporal, b"CS_RaytracingResolve"));
+
+        let pixel = super::super::shader("pixel", b"\0DXIL\0CS_RaytracingResolve\0\0");
+        assert!(!matches(&pixel, b"CS_RaytracingResolve"), "only a compute program is one of these");
     }
 }

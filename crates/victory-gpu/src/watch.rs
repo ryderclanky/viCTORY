@@ -307,6 +307,132 @@ pub(crate) fn wrote_own(page: usize, others: &[usize]) -> (u64, u64) {
     (before, now)
 }
 
+/// Whether what the copy-back writes into title memory is kept from
+/// counting as the title's writing for the copy it came from
+/// (`VICTORY_QUIET_BACK=1`; off by default).
+///
+/// The card's bytes go into title memory through the kernel
+/// (`crate::host::write_mapped`), and the kernel then reports those pages
+/// written like any other. The copy the bytes came from read them again at
+/// its next refresh, compared them, found nothing, and a range shaders
+/// write every frame was looked at this way at every submission: an eighth
+/// of the submitting thread's time in the reference fork's sample, beside
+/// the refreshes' own reading. With the switch the thread that copies back
+/// asks about the page it is about to write (what the title wrote there is
+/// noted in the journal as before), writes, resets the kernel's note of
+/// its own write, and notes the page in the journal itself: other copies
+/// of the same memory still see it written, and the copy it came from is
+/// told it holds it (`crate::shadow`'s `holds`).
+///
+/// What it gives up, which is why it is off: the kernel's note of our
+/// write cannot be told from one of the title's in the same 4 KiB page, so
+/// a write of the title's that lands between our asking and our reset goes
+/// with ours, and the copy that wrote goes on holding the bytes from
+/// before. In the reference fork, with this on by default, runs came up
+/// with lights and colours missing.
+pub(crate) fn quiet_back() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_QUIET_BACK").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!(
+                "the copy-back's writes are kept from counting as the title's for the copy they came from (VICTORY_QUIET_BACK=1)"
+            );
+        }
+        on
+    })
+}
+
+/// Before our own write of `[at, at + len)` ([`quiet_back`]): asks the
+/// kernel about the whole 64 KiB page holding the stretch and notes in the
+/// journal what it found written. Returns the journal's 64 KiB pages that
+/// held a write of the title's, so that the copy that wrote does not claim
+/// to hold them (`crate::shadow`'s `holds`); `None` if the memory is not
+/// write-watched or the page is not all of one, with nothing done.
+///
+/// The page and not the stretch: a stretch of the copy-back is at most
+/// part of a 64 KiB page, and a copy notes a page whole. A title write in
+/// another part of the page, found here, keeps the page from being
+/// quieted; one made after this asking is left to the kernel (our reset,
+/// [`ours_after`], covers only the 4 KiB pages we wrote).
+pub(crate) fn ours_before(at: usize, len: usize) -> Option<Vec<usize>> {
+    use windows_sys::Win32::System::Memory::GetWriteWatch;
+    const WRITE_WATCH_FLAG_RESET: u32 = 1;
+    let page = at / PAGE;
+    let first = page * PAGE;
+    let last = (page + 1).checked_mul(PAGE)?;
+    if len == 0 || at.saturating_add(len) > last {
+        return None;
+    }
+    // The kernel cannot report more written pages than the page holds: one
+    // answer for each of its 4 KiB pages.
+    let mut found = [0usize; PAGE / KERNEL_PAGE];
+    let mut count = found.len();
+    let mut granularity = 0;
+    // SAFETY: the answer buffer holds `count` entries.
+    let failed = unsafe {
+        GetWriteWatch(
+            WRITE_WATCH_FLAG_RESET,
+            first as *const _,
+            last - first,
+            found.as_mut_ptr().cast(),
+            &mut count,
+            &mut granularity,
+        )
+    } != 0;
+    if failed || count > found.len() {
+        return None;
+    }
+    let mut pages: Vec<usize> = found[..count].iter().map(|&at| at / PAGE).collect();
+    pages.sort_unstable();
+    pages.dedup();
+    if !pages.is_empty() {
+        let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        let j = &mut *j;
+        j.asked += 1;
+        let now = j.asked;
+        // As in [`wrote_own`]: a standing asking moves with the pages noted,
+        // or a copy taking them at it would find them written for ever.
+        if j.kept || !j.ahead.is_empty() {
+            j.ahead_asked = now;
+        }
+        for &at in &found[..count] {
+            j.written.insert(at / PAGE, now);
+        }
+    }
+    Some(pages)
+}
+
+/// After our own write of `[at, at + len)`, which [`ours_before`] answered
+/// for: the kernel forgets it, and the journal takes the 64 KiB pages of
+/// the range as written now. Per page: the asking that had last found it
+/// written (0: none) and this one, for the copy that wrote to note itself
+/// current where it had already taken the last write ([`quiet_back`]).
+pub(crate) fn ours_after(at: usize, len: usize) -> Vec<(usize, u64, u64)> {
+    use windows_sys::Win32::System::Memory::ResetWriteWatch;
+    if len == 0 {
+        return Vec::new();
+    }
+    let first = at & !(KERNEL_PAGE - 1);
+    let last = at.saturating_add(len).div_ceil(KERNEL_PAGE) * KERNEL_PAGE;
+    if last > first {
+        // SAFETY: a range of write-watched memory the kernel has just
+        // answered for ([`ours_before`]): the stretch lies inside one 64 KiB
+        // page, so the range lies inside one write-watched reservation.
+        unsafe { ResetWriteWatch(first as *const _, last - first) };
+    }
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let j = &mut *j;
+    j.asked += 1;
+    let now = j.asked;
+    if j.kept || !j.ahead.is_empty() {
+        j.ahead_asked = now;
+    }
+    (at / PAGE..=at.saturating_add(len - 1) / PAGE)
+        .map(|page| (page, j.written.insert(page, now).unwrap_or(0), now))
+        .collect()
+}
+
 /// The asking that last found the 64 KiB page numbered `page` written (0:
 /// never). Read only, for `crate::backreads`.
 #[cfg(feature = "diagnostics")]
@@ -1257,6 +1383,89 @@ mod tests {
             )
             .is_none()
         );
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// The copy-back's own write is not the title's: what the title wrote
+    /// into the page is reported before it (`ours_before`), the kernel then
+    /// forgets our write but not a write of the title's made after it, and
+    /// the journal has the page as written at our asking, which a copy that
+    /// never took it still re-reads.
+    #[test]
+    fn our_write_is_kept_from_counting_as_the_titles() {
+        use windows_sys::Win32::System::Memory::GetWriteWatch;
+        // SAFETY: a fresh write-watched allocation, freed at the end.
+        let p = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                2 * PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(p, 0);
+        let page = p / PAGE + 1;
+        let (base, stretch) = (page * PAGE, 1024);
+        let at = base + 256;
+        // The kernel's answer for 4 KiB pages of `[first, first + n)`.
+        let kernel = |first: usize, n: usize| {
+            let mut found = [0usize; 16];
+            let (mut count, mut granularity) = (found.len(), 0);
+            // SAFETY: the answer buffer holds `count` entries.
+            let failed = unsafe {
+                GetWriteWatch(
+                    1,
+                    first as *const _,
+                    n,
+                    found.as_mut_ptr().cast(),
+                    &mut count,
+                    &mut granularity,
+                )
+            } != 0;
+            (failed, found[..count].to_vec())
+        };
+        // The title writes in the page, in the 4 KiB page our write is in.
+        // SAFETY: committed pages of ours.
+        unsafe {
+            ((at + 16) as *mut u8).write(1);
+            ((base + 2 * KERNEL_PAGE) as *mut u8).write(2);
+        }
+        let theirs = ours_before(at, stretch).expect("watched");
+        assert_eq!(theirs, [page], "the page the title wrote into");
+        let (_, after_asking) = kernel(base, PAGE);
+        assert!(after_asking.is_empty(), "our asking cleared the page's bits");
+        // Our write, then the kernel forgets it.
+        // SAFETY: our stretch, inside the page.
+        unsafe { std::ptr::write_bytes(at as *mut u8, 0xAB, stretch) };
+        let marks = ours_after(at, stretch);
+        assert_eq!(marks.len(), 1);
+        let (marked, before, now) = marks[0];
+        assert_eq!(marked, page);
+        assert!(before > 0, "the asking that had found the title's write");
+        assert!(now > before);
+        let (_, after_reset) = kernel(base, PAGE);
+        assert!(after_reset.is_empty(), "our write was forgotten");
+        // The journal has the page at our asking, at a page a copy had
+        // never taken and for one it had.
+        let (_, written) = writes(base, base + PAGE, false).expect("watched");
+        assert_eq!(written, [(page, now)]);
+        // A write of the title's after ours is still the kernel's to report:
+        // in our own 4 KiB page and beside it.
+        // SAFETY: committed pages of ours.
+        unsafe {
+            ((at + 32) as *mut u8).write(3);
+            ((base + 3 * KERNEL_PAGE) as *mut u8).write(4);
+        }
+        let (failed, again) = kernel(base, PAGE);
+        assert!(!failed);
+        assert_eq!(again.len(), 2, "{again:x?}");
+        // Memory that is not write-watched: nothing to do.
+        let mut plain = vec![0u8; 2 * PAGE];
+        assert!(ours_before(plain.as_mut_ptr() as usize, 16).is_none());
+        // The journal is the process's, and an allocation comes back at these
+        // addresses in another test: what is noted here would be read there.
+        JOURNAL.lock().unwrap_or_else(|e| e.into_inner()).written.remove(&page);
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }

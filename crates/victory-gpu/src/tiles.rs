@@ -46,8 +46,8 @@
 //! Only for a texture the title places in memory and fills, two-dimensional,
 //! one layer, more than one level, of [`floor`] bytes or more, whose memory
 //! is not all its own when the host copy is made (`resource.rs` `hosted`);
-//! every other texture is made as before. Off unless
-//! `VICTORY_LEVELS_ON_DEMAND=1`.
+//! every other texture is made as before. `VICTORY_LEVELS_ON_DEMAND=1` opts
+//! in and `=0` opts out; absent an override, the small-memory profile opts in.
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -72,13 +72,24 @@ const HEAP_TILES: u32 = 1024;
 pub(crate) static STATS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
 
 /// Whether textures are made this way: the switch
-/// (`VICTORY_LEVELS_ON_DEMAND=1`; off by default), and a card that reads
+/// (`VICTORY_LEVELS_ON_DEMAND=1`), and a card that reads
 /// zeros from, and drops writes to, levels without memory (tiled resources
 /// tier 2).
 pub(crate) fn wanted() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        if !std::env::var_os("VICTORY_LEVELS_ON_DEMAND").is_some_and(|v| v == "1") {
+        // On where the card is small enough to need it (`crate::tuning`): below an 8 GB budget
+        // the levels the title does not hold are 2.2 to 3.0 GB of a card that has no room, and
+        // what they cost instead is eviction and recreation. `VICTORY_LEVELS_ON_DEMAND=0` turns
+        // it off, `=1` on.
+        let want = match std::env::var("VICTORY_LEVELS_ON_DEMAND").ok().as_deref().map(str::trim) {
+            Some("0") => false,
+            Some("1") => true,
+            // Ignore misspellings rather than enabling a memory-sensitive path.
+            Some(_) => crate::tuning::profile().levels_on_demand,
+            None => crate::tuning::profile().levels_on_demand,
+        };
+        if !want {
             return false;
         }
         let Some(host) = host() else {
@@ -99,7 +110,7 @@ pub(crate) fn wanted() -> bool {
             tier,
             on,
             floor_kb = floor() >> 10,
-            "host copies of title textures take the card's memory level by level (VICTORY_LEVELS_ON_DEMAND=1)"
+            "host copies of title textures take the card's memory level by level (VICTORY_LEVELS_ON_DEMAND, or this machine's profile)"
         );
         on
     })

@@ -123,10 +123,14 @@ pub(crate) fn available_physical_ram() -> Option<u64> {
 /// Effective idle timeout (in milliseconds) for VRAM-backed host textures,
 /// scaled down under VRAM pressure. Never returns less than 1,000 ms so
 /// handles not yet recorded into a list or slot remain protected.
+pub(crate) const VRAM_IDLE_NORMAL_MS: u64 = 5_000;
+pub(crate) const VRAM_IDLE_MODERATE_MS: u64 = 2_500;
+const VRAM_IDLE_HIGH_MS: u64 = 1_000;
+
 pub(crate) fn vram_idle_ms(video_memory: Option<[u64; 4]>) -> u64 {
-    const NORMAL_MS: u64 = 5_000;
-    const MODERATE_MS: u64 = 2_500;
-    const HIGH_MS: u64 = 1_000;
+    const NORMAL_MS: u64 = VRAM_IDLE_NORMAL_MS;
+    const MODERATE_MS: u64 = VRAM_IDLE_MODERATE_MS;
+    const HIGH_MS: u64 = VRAM_IDLE_HIGH_MS;
     let Some([budget, used, ..]) = video_memory else {
         return NORMAL_MS;
     };
@@ -140,6 +144,30 @@ pub(crate) fn vram_idle_ms(video_memory: Option<[u64; 4]>) -> u64 {
         MODERATE_MS
     } else {
         NORMAL_MS
+    }
+}
+
+/// [`vram_idle_ms`], by whether the texture queue has room to make another host copy
+/// (`crate::resource::room`) rather than by the share of the budget in use alone
+/// (`VICTORY_VRAM_IDLE_BY_ROOM=0`: by the share, as before).
+///
+/// The queue fills the card up to its own line — 92 % of the budget on this machine, less what
+/// is kept for render targets and for copies of title buffers — so there is room to spare while
+/// the share in use still sits above 85 %: the sweep then let go of copies nobody had asked for
+/// in a second, and each was made and uploaded again at its next use, black until then. The
+/// sibling fork logged 46,803 of them (11.4 GB) in the first 200 s of one run for exactly this
+/// want of a distinction between "the card is full" and "the queue is at its line". With room
+/// the normal time comes back; without it, the shorter ones as before.
+pub(crate) fn vram_idle_ms_by_room(video_memory: Option<[u64; 4]>, room: bool) -> u64 {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let by_share = vram_idle_ms(video_memory);
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_VRAM_IDLE_BY_ROOM").is_none_or(|v| v != "0")) {
+        return by_share;
+    }
+    if room {
+        VRAM_IDLE_NORMAL_MS
+    } else {
+        by_share.min(VRAM_IDLE_MODERATE_MS)
     }
 }
 
@@ -348,7 +376,9 @@ pub(crate) fn log_removal_context() {
 
 /// Time spent in submissions since the last frame-rate line, in
 /// microseconds: preparing them on the CPU (title memory copies, texture
-/// detiling), then waiting for the GPU.
+/// detiling), then waiting for the GPU. The wait is the frame log's
+/// `CardWaitUs` only: the frame line's "on the GPU" is the card's own busy
+/// time (`card_clock_line`), which no thread's waiting decides.
 static SUBMISSION_US: [std::sync::atomic::AtomicU64; 2] =
     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 
@@ -476,15 +506,27 @@ fn card_clock_watch(clock: &'static CardClock) {
 }
 
 /// For the frame-rate line: [`CARD_CLOCK_US`] per frame, `ms` being the
-/// frame's time.
-fn card_clock_line(frames: f64, ms: f64) {
+/// frame's time. Returns the card's own busy time per frame, which the
+/// frame line prints as "on the GPU".
+///
+/// That figure used to be [`SUBMISSION_US`]'s wait, which only the thread
+/// that submits writes, and which with `VICTORY_RELAY` (run 193's setting)
+/// never waits at all: the relay thread lands the flights, so the wait
+/// happened there and 26 of 67 frame lines printed "0.0 on the GPU" over
+/// frames that landed 202.4 ms of copy-back and whose card reported up to
+/// 92 % busy. The card's clock is read by a thread of its own between
+/// fence signals, so its idle time is the interval the line claims
+/// whatever thread waits: what the card did not idle is what it ran.
+fn card_clock_line(frames: f64, ms: f64) -> f64 {
     let [idle, behind, stood] = [0, 1, 2].map(|i| CARD_CLOCK_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
+    let busy = if ms > 0.0 { (ms - idle).clamp(0.0, ms) } else { 0.0 };
     tracing::info!(
         "the card's clock per frame: nothing of ours queued {idle:.1} ms (the card about {:.0}% busy by this count), \
          {behind:.1} ms of that while the submitting thread was working (the card idle behind us), the rest while the title \
          had not submitted; the submitting thread stood waiting for the card {stood:.1} ms",
         if ms > 0.0 { (100.0 * (1.0 - idle / ms)).clamp(0.0, 100.0) } else { 0.0 }
     );
+    busy
 }
 
 /// Of the preparing: title memory copies (microseconds, bytes) and texture
@@ -7829,10 +7871,11 @@ impl Meter {
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
         let draws = (drawn - self.drawn) as f64 / frames;
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
-        // Of a frame, ms preparing submissions and ms waiting for the GPU.
-        let [cpu, gpu] = [0, 1].map(|i| {
-            SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames
-        });
+        // Of a frame, ms preparing submissions and ms on the GPU (the card's
+        // own busy time, from its clock below: the wait the submitting
+        // thread did was 0.0 in 26 of 67 frame lines while the relay thread
+        // landed 60 to 430 ms a frame of copy-back).
+        let cpu = SUBMISSION_US[0].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames;
         let [copy_ms, copy_mb, texture_ms, texture_mb] = [0, 1, 2, 3].map(|i| {
             let scale = if i % 2 == 0 { 1e3 } else { 1e6 };
             PREPARING[i].swap(0, Ordering::Relaxed) as f64 / scale / frames
@@ -7859,10 +7902,11 @@ impl Meter {
                 slots as f64 / frames
             );
         }
+        crate::draw::heap_profile_line(frames);
         crate::shadow::exact_line(frames);
         crate::descriptor::sync_line(frames);
         late_line(frames);
-        card_clock_line(frames, ms);
+        let gpu = card_clock_line(frames, ms);
         crate::queue2::line(frames);
         crate::plaincopy::line(frames);
         #[cfg(feature = "diagnostics")]

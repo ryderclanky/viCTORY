@@ -123,6 +123,22 @@ impl<'a> Lower<'a> {
         }
         let pointer = x[0];
         let pointer_high = wide.then(|| x[1]);
+        if crate::emit::bvh_empty() {
+            // The opt-in fallback applies only to the supported barycentric mode. A box
+            // miss must return four absent-child sentinels; a triangle miss uses `bvh::MISS`.
+            // Returning the triangle result for a box would make traversal treat infinities as
+            // child indices and continue reading unbuilt structure memory.
+            let entry = self.s.entry;
+            let (k6, k4, none) = (self.s.m.i32(6), self.s.m.i32(4), self.s.m.i32(bvh::NONE));
+            let kind_bits = self.s.m.bin(entry, Bin::And, pointer, k6);
+            let is_box = self.s.m.cmp(entry, pred::EQ, kind_bits, k4);
+            for (k, f) in bvh::MISS.iter().enumerate() {
+                let triangle_miss = self.s.m.i32(f.to_bits());
+                let result = self.s.m.select(entry, is_box, none, triangle_miss);
+                self.write(inst, Reg::V(dst + k as u8), result, guard);
+            }
+            return Ok(());
+        }
         let f: Vec<V> = x[1 + usize::from(wide)..]
             .iter()
             .map(|&v| self.as_float(v))

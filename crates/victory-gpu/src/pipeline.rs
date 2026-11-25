@@ -67,6 +67,10 @@ pub(crate) struct Shader {
     /// ([`Shader::walks`]).
     #[cfg(windows)]
     walks: OnceLock<bool>,
+    /// Whether it is the program that resolves the title's indirect diffuse light, whose
+    /// output [`crate::ambient`] raises to a least level (looked for by name once).
+    #[cfg(windows)]
+    pub(crate) resolves_light: bool,
 }
 
 impl std::fmt::Debug for Shader {
@@ -119,6 +123,9 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 translated: OnceLock::new(),
                 #[cfg(windows)]
                 walks: OnceLock::new(),
+                #[cfg(windows)]
+                resolves_light: bytes.windows(crate::ambient::PROGRAM.len())
+                    .any(|w| w == crate::ambient::PROGRAM),
             })
         })
         .clone()
@@ -276,6 +283,19 @@ impl Shader {
     /// at once, when a dispatch first asks.
     fn walks(&self) -> bool {
         *self.walks.get_or_init(|| container_walks(&self.container))
+    }
+}
+
+impl Shader {
+    /// Whether its container holds `name`, a program name of the title's
+    /// shader pack (`CS_RaytracingResolve`, ...), as bytes: the pack
+    /// carries the names as strings, so this is how [`make`] finds the
+    /// programs it leaves out. A variant's suffix counts
+    /// (`CS_ScreenProbes_TemporalResolve_*`, as `crate::ambient` notes).
+    /// Short of parsing the container, it cannot tell a name from the same
+    /// bytes in a program's code, which no name of the pack is known to be.
+    pub(crate) fn holds(&self, name: &[u8]) -> bool {
+        !name.is_empty() && self.container.windows(name.len()).any(|w| w == name)
     }
 }
 

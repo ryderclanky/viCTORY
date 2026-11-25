@@ -26,6 +26,14 @@
 //!   with an effect stands between them (another thread's unsynchronised
 //!   store may fall between any two reads or before both: the title's code
 //!   cannot tell which).
+//! - [`ACROSS`]: the same read for one place where every path to it has
+//!   already made the read and nothing has written, waited or called in
+//!   between. The lowering keeps one descriptor handle and reads it again
+//!   behind every guard, so one program (`CS_ScreenProbes_ActivateRays`,
+//!   66,501 instructions) reloads a single descriptor 2,399 times, and the
+//!   format decode behind those loads is 57 % of the module; that decode is
+//!   host memory in the driver's compiler, which ran out on the test
+//!   machine.
 //!
 //! Which passes run is `emit::shader_opt()` (`VICTORY_SHADER_OPT`), part of
 //! the translation and so of the shader cache's key.
@@ -47,6 +55,9 @@ pub const REUSE: u32 = 4;
 pub const FACTS: u32 = 8;
 /// One read for one place within a block, while nothing is stored.
 pub const LOADS: u32 = 16;
+/// One read for one place across blocks: the read every path to it has
+/// already made, while nothing has been written, waited or called since.
+pub const ACROSS: u32 = 128;
 /// Not a pass over the module: the lowering of a first-lane read in a
 /// wave64 program run as two host waves skips the exchange that asks which
 /// half has a lane where every lane is in EXEC (`lower.rs`,
@@ -58,11 +69,11 @@ pub const FIRST: u32 = 32;
 /// by a call each (`lower.rs`, `raw_dwords`). The same bytes are read.
 pub const WIDE: u32 = 64;
 /// The passes over the module.
-pub const MODULE: u32 = DEAD | FOLD | REUSE | FACTS | LOADS;
+pub const MODULE: u32 = DEAD | FOLD | REUSE | FACTS | LOADS | ACROSS;
 /// Every pass.
 pub const ALL: u32 = MODULE | FIRST | WIDE;
 /// The passes that run when nothing says which: every one but [`WIDE`],
-/// which no card has shown a gain for yet (`VICTORY_SHADER_OPT=127` asks
+/// which no card has shown a gain for yet (`VICTORY_SHADER_OPT=255` asks
 /// for it).
 pub const DEFAULT: u32 = ALL & !WIDE;
 
@@ -224,7 +235,7 @@ pub(super) fn effect(f: &Func) -> Effect {
 impl Module {
     /// Runs the clean-up passes named in `passes` ([`ALL`]: every one).
     pub(crate) fn optimise(&mut self, passes: u32) {
-        if passes & (FOLD | REUSE | FACTS | LOADS) != 0 {
+        if passes & (FOLD | REUSE | FACTS | LOADS | ACROSS) != 0 {
             // Values merged in one round can make two joins the same in
             // the next (a loop's registers that only go round), and a
             // branch that goes one way leaves blocks with one way in.
@@ -669,14 +680,70 @@ impl Module {
         })
     }
 
-    /// [`FOLD`], [`REUSE`], [`FACTS`] and [`LOADS`]: one walk over the
-    /// dominator tree. Returns whether anything changed.
+    /// [`ACROSS`]: for each block, the reads of memory every path to the
+    /// block has made with nothing written since, by the place they read.
+    /// A write ends all of them: a store through one descriptor is seen
+    /// through another bound to the same buffer, and a `globallycoherent`
+    /// one is seen through the same descriptor.
+    fn available_reads(&self, effects: &[Effect], tree: &Tree) -> Vec<HashMap<Key, V>> {
+        let n = self.blocks.len();
+        let mut entry: Vec<HashMap<Key, V>> = vec![HashMap::new(); n];
+        // Each block's reads as they leave it; not one until it is walked
+        // (a block before its first walk has an exit nothing tells yet).
+        let mut exit: Vec<Option<HashMap<Key, V>>> = vec![None; n];
+        // Blocks whose exit a change of a predecessor's may have moved:
+        // the entry first, then the successors of whatever moved.
+        let mut todo = vec![0usize];
+        let mut queued = vec![false; n];
+        queued[0] = true;
+        while let Some(b) = todo.pop() {
+            queued[b] = false;
+            // Only a read every way in has made, and the same read.
+            let mut now = match (b, tree.preds[b].first()) {
+                (0, _) | (_, None) => HashMap::new(),
+                (_, Some(&first)) => exit[first].clone().unwrap_or_default(),
+            };
+            for &p in tree.preds[b].iter().skip(1) {
+                let there = exit[p].as_ref();
+                now.retain(|key, v| there.is_some_and(|e| e.get(key) == Some(v)));
+            }
+            let mut leaves = now.clone();
+            for &i in &self.blocks[b].body {
+                match self.class(effects, i) {
+                    Effect::Writes => leaves.clear(),
+                    Effect::Reads => {
+                        if let Some(key) = self.key(i) {
+                            leaves.entry(key).or_insert(V::Inst(i));
+                        }
+                    }
+                    Effect::Pure | Effect::Lanes => {}
+                }
+            }
+            if exit[b].as_ref() == Some(&leaves) {
+                entry[b] = now;
+                continue;
+            }
+            entry[b] = now;
+            exit[b] = Some(leaves);
+            for &s in successors(self.blocks[b].term).iter() {
+                if !queued[s] {
+                    queued[s] = true;
+                    todo.push(s);
+                }
+            }
+        }
+        entry
+    }
+
+    /// [`FOLD`], [`REUSE`], [`FACTS`], [`LOADS`] and [`ACROSS`]: one walk
+    /// over the dominator tree. Returns whether anything changed.
     fn merge(&mut self, passes: u32) -> bool {
         if self.blocks.is_empty() {
             return false;
         }
         let effects = self.effects();
         let tree = self.dominator_tree();
+        let across = (passes & ACROSS != 0).then(|| self.available_reads(&effects, &tree));
         let mut repl: Vec<Option<V>> = vec![None; self.insts.len()];
         let mut changed = false;
         // Joins of one value: until none is left (one gone can leave
@@ -760,6 +827,9 @@ impl Module {
                 None => v,
             };
             read.clear();
+            // Whether the block has written: the reads every path to its
+            // entry had made are only theirs until then.
+            let mut wrote = false;
             // Two joins of the same values from the same blocks are one.
             if passes & REUSE != 0 && self.blocks[b].phis.len() > 1 {
                 let mut joins: HashMap<Vec<(usize, V)>, V> = HashMap::new();
@@ -827,20 +897,29 @@ impl Module {
                     added.push(key);
                 }
                 // Reads of memory, and wave operations (the same lanes run
-                // the whole block): the block's own earlier one.
-                if passes & LOADS != 0
+                // the whole block): the block's own earlier one, or
+                // ([`ACROSS`]) a read of the same place that every path
+                // here has made with nothing written since.
+                if passes & (LOADS | ACROSS) != 0
                     && matches!(class, Effect::Reads | Effect::Lanes)
                     && let Some(key) = self.key(i)
                 {
-                    if let Some(&first) = read.get(&key) {
-                        repl[i as usize] = Some(first);
+                    let first = read.get(&key).copied().or_else(|| match across.as_ref() {
+                        Some(reads) if class == Effect::Reads && !wrote => {
+                            reads[b].get(&key).copied()
+                        }
+                        _ => None,
+                    });
+                    if let Some(first) = first {
+                        repl[i as usize] = Some(resolve(&repl, first));
                         changed = true;
                         continue;
                     }
-                    read.insert(key, V::Inst(i));
+                    read.entry(key).or_insert(V::Inst(i));
                 }
                 if class == Effect::Writes {
                     read.clear();
+                    wrote = true;
                 }
                 kept.push(i);
             }
@@ -1599,6 +1678,238 @@ mod tests {
     }
 
     #[test]
+    fn a_read_below_its_block_is_the_earlier_one_until_a_write() {
+        let Diamond {
+            k:
+                Kit {
+                    mut m,
+                    reads,
+                    writes,
+                    ..
+                },
+            x,
+            y,
+            then,
+            other,
+            join,
+            ..
+        } = diamond();
+        let one = m.i32(1);
+        let two = m.i32(2);
+        // Behind the branch: the entry's read of (1, 1) again, a store, and
+        // the read of it again after the store; the other side's read of
+        // (2, 2) again, with nothing in the way.
+        let again = m.call(then, reads, vec![one, one]);
+        m.call(then, writes, vec![again, y]);
+        let after = m.call(then, reads, vec![one, one]);
+        m.call(then, writes, vec![after, y]);
+        let beside = m.call(other, reads, vec![two, two]);
+        m.call(other, writes, vec![beside, beside]);
+        // Past the join, where one side stored: neither read is one for
+        // every path here.
+        let below = m.call(join, reads, vec![one, one]);
+        m.call(join, writes, vec![below, below]);
+        m.optimise(ACROSS);
+        assert_eq!(stores(&m, then), [[x, y], [after, y]]);
+        assert_eq!(body(&m, then), 3, "the store, the read and the store");
+        assert_eq!(stores(&m, other), [[y, y]]);
+        assert_eq!(body(&m, other), 1);
+        let Op::Call(f, args) = &m.insts[m.blocks[join].body[0] as usize].op else {
+            panic!("the read past the join")
+        };
+        assert_eq!(m.funcs[*f as usize].name, "dx.op.bufferLoad.i32");
+        assert_eq!(args[..], [one, one], "read again past the store");
+        m.write();
+    }
+
+    #[test]
+    fn a_barrier_or_a_call_ends_the_reads_across_blocks() {
+        let Diamond {
+            k:
+                Kit {
+                    mut m,
+                    b,
+                    reads,
+                    writes,
+                    ..
+                },
+            x,
+            y,
+            then,
+            other,
+            join,
+            ..
+        } = diamond();
+        let i32t = m.int(32);
+        let fty = m.func_ty(i32t, vec![i32t, i32t]);
+        let barrier = m.function("dx.op.barrier", fty, Some(Attr::NoDuplicate), false);
+        let one = m.i32(1);
+        // A barrier on one side only: the read after it is made again, and
+        // so is the read past the join.
+        let seal = m.call(then, barrier, vec![one, one]);
+        let after = m.call(then, reads, vec![one, one]);
+        m.call(then, writes, vec![after, y]);
+        let _ = seal;
+        let ok = m.call(other, reads, vec![one, one]);
+        m.call(other, writes, vec![ok, ok]);
+        let below = m.call(join, reads, vec![one, one]);
+        m.call(join, writes, vec![below, below]);
+        m.optimise(ACROSS);
+        assert_eq!(body(&m, then), 3, "the barrier, the read and the store");
+        assert_eq!(stores(&m, other), [[x, x]], "nothing stands in the way");
+        let Op::Call(f, args) = &m.insts[m.blocks[join].body[0] as usize].op else {
+            panic!("the read past the join")
+        };
+        assert_eq!(m.funcs[*f as usize].name, "dx.op.bufferLoad.i32");
+        assert_eq!(args[..], [one, one], "read again past the barrier");
+        let _ = b;
+        m.write();
+    }
+
+    #[test]
+    fn a_loop_body_reads_what_its_head_read_and_the_head_reads_again() {
+        let Diamond {
+            k:
+                Kit {
+                    mut m,
+                    b,
+                    reads,
+                    writes,
+                    ..
+                },
+            x,
+            y,
+            then,
+            ..
+        } = diamond();
+        let one = m.i32(1);
+        let three = m.i32(3);
+        let (head, round, exit) = (m.new_block(), m.new_block(), m.new_block());
+        m.terminate(then, Term::Br(head));
+        // The head reads two places; the loop's blocks read them again, and
+        // so does the join past it. The head's own reads stay: on the first
+        // turn of the loop no block before it has read either.
+        let a = m.call(head, reads, vec![one, one]);
+        let c = m.call(head, reads, vec![three, three]);
+        let test = m.cmp(head, pred::IULT, a, c);
+        m.terminate(head, Term::CondBr(test, round, exit));
+        m.call(round, reads, vec![one, one]);
+        m.call(round, reads, vec![three, three]);
+        m.terminate(round, Term::Br(head));
+        let below = m.call(exit, reads, vec![one, one]);
+        m.call(exit, writes, vec![below, c]);
+        m.terminate(exit, Term::Ret);
+        m.optimise(ACROSS);
+        assert_eq!(body(&m, head), 3, "the two reads and the test");
+        assert_eq!(body(&m, round), 0, "the head's reads are the loop's");
+        assert_eq!(
+            stores(&m, exit),
+            [vec![a, c]],
+            "the head's reads past the join"
+        );
+        let _ = (b, x, y);
+        m.write();
+    }
+
+    /// A program of the shape the pass is for: one descriptor handle and
+    /// one index, read again in every block behind a guard, with `decode`
+    /// arithmetic instructions on each read. Returns the instructions and
+    /// the reads of it as lowered, with [`ACROSS`] alone, with every pass
+    /// but it, and with [`ALL`].
+    fn guarded_chain(blocks: u32, decode: u32, store_each: bool) -> [(usize, usize); 4] {
+        fn build(blocks: u32, decode: u32, store_each: bool) -> Module {
+            let mut k = kit();
+            let i32t = k.m.int(32);
+            let b = k.b;
+            let (one, two) = (k.m.i32(1), k.m.i32(2));
+            // The handle and the index: values of the entry block.
+            let h = k.m.call(b, k.pure, vec![one, one]);
+            let r = k.m.call(b, k.pure, vec![one, two]);
+            let mut acc = k.m.call(b, k.pure, vec![two, two]);
+            let mut at = b;
+            for _ in 0..blocks {
+                let next = k.m.new_block();
+                k.m.terminate(at, Term::Br(next));
+                let p = k.m.phi(next, i32t);
+                k.m.set_phi(p, vec![(acc, at)]);
+                let v = k.m.call(next, k.reads, vec![h, r]);
+                // The decode of what was read: the same instructions,
+                // whichever block reads it.
+                let mut d = v;
+                for _ in 0..decode {
+                    d = k.m.bin(next, Bin::Add, d, r);
+                }
+                if store_each {
+                    k.m.call(next, k.writes, vec![d, p]);
+                }
+                acc = k.m.bin(next, Bin::Add, p, d);
+                at = next;
+            }
+            k.m.call(at, k.writes, vec![acc, acc]);
+            k.m.terminate(at, Term::Ret);
+            k.m
+        }
+        let counts = |m: &Module| {
+            let instructions: usize = m.blocks.iter().map(|b| b.body.len() + b.phis.len()).sum();
+            let reads = m
+                .blocks
+                .iter()
+                .flat_map(|b| b.body.iter())
+                .filter(|&&i| {
+                    matches!(&m.insts[i as usize].op,
+                        Op::Call(f, _) if m.funcs[*f as usize].name == "dx.op.bufferLoad.i32")
+                })
+                .count();
+            (instructions, reads)
+        };
+        let unchanged = counts(&build(blocks, decode, store_each));
+        let mut across = build(blocks, decode, store_each);
+        across.optimise(ACROSS);
+        let mut without = build(blocks, decode, store_each);
+        without.optimise(ALL & !ACROSS);
+        let mut all = build(blocks, decode, store_each);
+        all.optimise(ALL);
+        [unchanged, counts(&across), counts(&without), counts(&all)]
+    }
+
+    #[test]
+    fn a_place_read_in_every_block_is_read_once() {
+        let [before, across, .., all] = guarded_chain(64, 4, false);
+        assert_eq!(before.1, 64);
+        assert_eq!(across.1, 1, "one read for the whole chain");
+        assert_eq!(before.0 - across.0, 63, "63 reads are gone");
+        assert!(before.0 - all.0 >= 63 * 5, "and the decode behind each");
+        // A store in every block ends the window: exactness keeps the reads.
+        let [before, across, ..] = guarded_chain(64, 4, true);
+        assert_eq!(before, across, "every block stores");
+    }
+
+    /// The program the pass is for, at its size: `CS_ScreenProbes_ActivateRays`
+    /// is 66,501 instructions and reads one descriptor 2,399 times, with the
+    /// format decode behind those reads 57 % of the module. Read (with
+    /// `--nocapture`) the counts of a program of that shape; the cut is
+    /// the load and the decode of it, kept once.
+    #[test]
+    fn a_program_of_the_titles_shape_keeps_one_read_and_one_decode() {
+        let [before, across, without, all] = guarded_chain(2_399, 24, false);
+        println!(
+            "screen-probe shape: {} / {} without this pass / {} with it alone / {} with every pass; reads {} -> {}",
+            before.0, without.0, across.0, all.0, before.1, all.1
+        );
+        assert_eq!(before.1, 2_399);
+        assert_eq!(across.1, 1, "one read for the whole program");
+        assert_eq!(all.1, 1);
+        assert_eq!(without.1, 2_399, "nothing else touches those reads");
+        assert!(without.0 * 10 > before.0 * 9, "and they stay in the module");
+        assert!(
+            all.0 * 20 < before.0,
+            "every pass leaves {} of {} instructions",
+            all.0,
+            before.0
+        );
+    }
+
+    #[test]
     fn a_join_of_one_value_and_two_equal_joins() {
         let Diamond {
             k: Kit { mut m, writes, .. },
@@ -1815,9 +2126,13 @@ mod tests {
         input: V,
         table: V,
         wave: V,
+        barrier: V,
         /// The operands of the block's last read (to read the place again,
         /// and to store to it).
         last: Option<(V, V)>,
+        /// Places of the entry block, which every block below can read and
+        /// store to: the descriptor a program reads behind every guard.
+        places: Vec<(V, V)>,
     }
 
     impl Gen {
@@ -1831,6 +2146,21 @@ mod tests {
         fn reg(&mut self) -> V {
             let n = self.next(self.regs.len() as u64) as usize;
             self.regs[n]
+        }
+
+        /// A place (two values of the block entered) the blocks below may
+        /// read and store to again.
+        fn place(&mut self) {
+            let n = self.places.len() as u64;
+            let pick = self.next(3);
+            let (x, y) = match pick {
+                0 | 1 if n > 0 => {
+                    let at = self.next(n) as usize;
+                    self.places[at]
+                }
+                _ => (self.reg(), self.reg()),
+            };
+            self.last = Some((x, y));
         }
 
         /// A register or a small constant.
@@ -1881,7 +2211,7 @@ mod tests {
             let d = self.next(self.regs.len() as u64) as usize;
             let i32t = self.k.m.int(32);
             let f32t = self.k.m.float();
-            let r = match self.next(14) {
+            let r = match self.next(22) {
                 0..=3 => {
                     let op = [Bin::Add, Bin::Sub, Bin::Mul, Bin::And, Bin::Or, Bin::Xor]
                         [self.next(6) as usize];
@@ -1906,8 +2236,8 @@ mod tests {
                     let f = [self.k.pure, self.input, self.table, self.wave][self.next(4) as usize];
                     self.k.m.call(c, f, vec![x, y])
                 }
-                8 | 9 => {
-                    let again = self.next(2) == 0;
+                8..=10 => {
+                    let again = self.next(4) != 0;
                     let (x, y) = match self.last {
                         Some(last) if again => last,
                         _ => (self.value(), self.value()),
@@ -1915,8 +2245,10 @@ mod tests {
                     self.last = Some((x, y));
                     self.k.m.call(c, self.k.reads, vec![x, y])
                 }
-                10 => {
-                    // A store, half the time to the place read last.
+                11 => {
+                    // A store, half the time to the place read last: rare
+                    // enough that reads of the same place reach the blocks
+                    // below, often enough that they must not cross it.
                     let (mut x, y) = (self.value(), self.value());
                     let there = self.next(2) == 0;
                     if let Some((a, b)) = self.last
@@ -1927,7 +2259,7 @@ mod tests {
                     self.k.m.call(c, self.k.writes, vec![x, y]);
                     return;
                 }
-                11 => {
+                12..=15 => {
                     // Float arithmetic, read back as bits.
                     let (x, y) = (self.value(), self.value());
                     let (x, y) = (
@@ -1943,9 +2275,16 @@ mod tests {
                     }
                     self.k.m.cast(c, Cast::Bitcast, f, i32t)
                 }
-                12 => {
+                16 | 17 => {
                     let g = self.cond();
                     self.k.m.cast(self.cur, Cast::ZExt, g, i32t)
+                }
+                18 => {
+                    // A barrier: reads made before it are not the reads
+                    // after it.
+                    let (x, y) = (self.value(), self.value());
+                    self.k.m.call(c, self.barrier, vec![x, y]);
+                    return;
                 }
                 _ => {
                     let x = self.value();
@@ -1978,13 +2317,13 @@ mod tests {
             self.k.m.terminate(self.cur, Term::CondBr(c, then, other));
             let (before, known) = (self.regs.clone(), self.conds.len());
             self.cur = then;
-            self.last = None;
+            self.place();
             self.code(depth);
             let (then_regs, then_end) = (std::mem::replace(&mut self.regs, before), self.cur);
             self.k.m.terminate(then_end, Term::Br(join));
             self.conds.truncate(known);
             self.cur = other;
-            self.last = None;
+            self.place();
             if self.next(3) != 0 {
                 self.code(depth);
             }
@@ -1999,7 +2338,7 @@ mod tests {
                 self.regs[r] = p;
             }
             self.cur = join;
-            self.last = None;
+            self.place();
         }
 
         /// A loop that runs at most a few times, every register joined at
@@ -2017,7 +2356,7 @@ mod tests {
             self.regs = joins.clone();
             let known = self.conds.len();
             self.cur = head;
-            self.last = None;
+            self.place();
             self.code(depth);
             let one = self.k.m.i32(1);
             let next = self.k.m.bin(self.cur, Bin::Add, count, one);
@@ -2039,7 +2378,7 @@ mod tests {
             self.k.m.set_phi(count, vec![(zero, before), (next, latch)]);
             self.conds.truncate(known);
             self.cur = exit;
-            self.last = None;
+            self.place();
         }
     }
 
@@ -2061,6 +2400,8 @@ mod tests {
             Some(Attr::NoUnwind),
             false,
         );
+        let barrier =
+            k.m.function("dx.op.barrier", fty, Some(Attr::NoDuplicate), false);
         let b = k.b;
         let mut g = Gen {
             k,
@@ -2071,13 +2412,17 @@ mod tests {
             input,
             table,
             wave,
+            barrier,
             last: None,
+            places: Vec::new(),
         };
         for r in 0..5 {
             let (x, y) = (g.k.m.i32(r), g.k.m.i32(r * 3));
             let v = g.k.m.call(b, input, vec![x, y]);
             g.regs.push(v);
         }
+        // Two places of the entry block: read again and stored to below.
+        g.places = vec![(g.regs[1], g.regs[2]), (g.regs[3], g.regs[4])];
         g.code(3);
         g.code(2);
         // Every register is read at the end.
@@ -2092,6 +2437,12 @@ mod tests {
     #[test]
     fn every_pass_leaves_what_random_programs_store() {
         let mut removed = 0;
+        // What the reads across blocks alone take away: the programs must
+        // read the same places in block after block for the pass to matter.
+        let mut across = 0;
+        // Every other pass, with and without it.
+        const WITHOUT: u32 = ALL & !ACROSS;
+        let (mut without, mut with_all) = (0, 0);
         for seed in 1..=400u64 {
             let plain = random_program(seed);
             let inputs: Vec<Vec<u32>> = (0..6u32)
@@ -2123,8 +2474,11 @@ mod tests {
                 REUSE,
                 FACTS,
                 LOADS,
+                ACROSS,
+                LOADS | ACROSS,
                 FOLD | FACTS,
                 FOLD | REUSE | DEAD,
+                WITHOUT,
                 ALL,
             ] {
                 let mut m = random_program(seed);
@@ -2132,14 +2486,35 @@ mod tests {
                 for (i, want) in inputs.iter().zip(&expected) {
                     assert_eq!(&run(&m, i), want, "seed {seed}, passes {passes}");
                 }
+                let left: usize = m.blocks.iter().map(|b| b.body.len() + b.phis.len()).sum();
                 if passes == ALL {
-                    let left: usize = m.blocks.iter().map(|b| b.body.len() + b.phis.len()).sum();
                     removed += written - left;
+                }
+                if passes == ACROSS {
+                    across += written - left;
+                }
+                if passes == WITHOUT {
+                    without += left;
+                }
+                if passes == ALL {
+                    with_all += left;
                 }
                 m.write();
             }
         }
         // The programs are of the wasteful kind: the passes find work.
         assert!(removed > 4000, "{removed} instructions removed");
+        assert!(
+            across > 300,
+            "{across} instructions read again across blocks"
+        );
+        // The pass takes instructions away and never adds one.
+        assert!(
+            with_all < without,
+            "{with_all} instructions with the reads across blocks, {without} without"
+        );
+        println!(
+            "corpus: {with_all} with the reads across blocks, {without} without; {across} gone with it alone"
+        );
     }
 }

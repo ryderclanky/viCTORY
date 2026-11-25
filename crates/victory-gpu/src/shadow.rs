@@ -1693,12 +1693,26 @@ fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usiz
 /// ranges compared in windows and in buffers' copies.
 static BACK_CLASS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 
+/// Since the last frame-rate line, with `crate::watch::quiet_back`: the 64
+/// KiB pages of title memory the copy-back noted current for the copy it
+/// came from (which the copy's next refresh then need not read and
+/// compare), and the stretches of the copy-back that did so.
+static QUIET_BACK: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
 /// For the frame-rate line: where the CPU's search for shader writes goes
 /// (per frame). A copy of a title buffer can go to the card's memory,
 /// where the card does the search (`VICTORY_CARD_BUFFERS_MIN_MB`); a
 /// window outside buffers cannot as the code stands.
 pub(crate) fn back_line(frames: f64) {
     let c: Vec<f64> = BACK_CLASS.iter().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    let [quiet, stretches] = [0, 1].map(|i| QUIET_BACK[i].swap(0, Ordering::Relaxed) as f64 / frames);
+    if quiet != 0.0 {
+        tracing::info!(
+            "pages written back per frame that the copy they came from need not read again (VICTORY_QUIET_BACK=1): \
+             {quiet:.1} in {stretches:.1} stretches, {:.1} MB",
+            quiet * PAGE as f64 / (1 << 20) as f64
+        );
+    }
     if c.iter().all(|&v| v == 0.0) {
         return;
     }
@@ -2494,6 +2508,47 @@ fn stale_pages_in(base: usize, copied: &[u64], a: usize, e: usize, written: &[(u
                 .is_ok_and(|i| written[i].1 > at),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod quiet_tests {
+    use super::*;
+
+    /// A copy-back write quiets a page only where the copy holds the title's
+    /// bytes: it had taken the page, its last write of the page came no
+    /// later, and the title did not write into the page before our write.
+    #[test]
+    fn only_pages_the_copy_holds_are_quieted() {
+        let base = 0x100;
+        let mut copied = [5, 0, 5, 5, 5, 0];
+        let marks = [(0x100, 5, 9), (0x101, 5, 9), (0x102, 6, 9), (0x103, 3, 9), (0x104, 1, 9), (0x0ff, 1, 9)];
+        // Page 0x104 is in the title's too; page 0x0ff is not this copy's;
+        // page 0x101 was never taken; page 0x102 was taken before its last
+        // write and page 0x103 after.
+        assert_eq!(quieted(&mut copied, base, &marks, &[0x104]), 2);
+        assert_eq!(copied, [9, 0, 5, 9, 5, 0]);
+    }
+
+    /// A quieted page is not read again for the copy that wrote it, and is
+    /// still stale for any other copy: the journal has the page at our
+    /// asking for all of them, which is what keeps a quieted page that the
+    /// title did write from being missed.
+    #[test]
+    fn a_quieted_page_is_not_read_again_by_the_copy_that_wrote_it() {
+        let (base, page, now) = (0x200, 0x201, 9);
+        let at = |page: usize| page * PAGE;
+        let mut ours = [5, 5];
+        assert_eq!(quieted(&mut ours, base, &[(page, 5, now)], &[]), 1);
+        let written = [(page, now)];
+        assert!(stale_pages_in(base, &ours, at(page), at(page + 1), &written).is_empty());
+        // Another copy took the page before our write, and one never did.
+        assert_eq!(stale_pages_in(base, &[5, 5], at(page), at(page + 1), &written), [page]);
+        assert_eq!(stale_pages_in(base, &[5, 0], at(page), at(page + 1), &written), [page]);
+        // And one the title also wrote into is not quieted at all.
+        let mut held = [5, 5];
+        assert_eq!(quieted(&mut held, base, &[(page, 5, now)], &[page]), 0);
+        assert_eq!(stale_pages_in(base, &held, at(page), at(page + 1), &written), [page]);
+    }
 }
 
 #[cfg(test)]
@@ -3937,13 +3992,65 @@ impl Shadow {
             crate::backreads::stored(self.id, (self.start, self.len), start + at, n, true);
             return n;
         }
+        // With `quiet_back`: what the title wrote into the page is asked
+        // about before ours, since after our write the kernel no longer
+        // holds a write of the title's in the 4 KiB pages we wrote.
+        let theirs = if crate::watch::quiet_back() { crate::watch::ours_before(start + at, n) } else { None };
         crate::watch::writing(start + at, n);
         merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "card relay");
         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+        if let Some(theirs) = &theirs {
+            self.holds(&crate::watch::ours_after(start + at, n), theirs);
+        }
         #[cfg(feature = "diagnostics")]
         crate::backreads::stored(self.id, (self.start, self.len), start + at, n, false);
         n
     }
+
+    /// With `crate::watch::quiet_back`: the copy-back wrote the journal
+    /// pages of `marks` (page, the asking that had last found it written,
+    /// this one) into title memory from the copy's own bytes, so the copy
+    /// holds them and its next refresh need not read and compare them
+    /// again. Not a page of `theirs`, where the title wrote into the page
+    /// before our write and our write may have put its bytes under ours,
+    /// nor one the copy never took (`copied` 0), nor one whose last write
+    /// came after the copy took it: there the copy does not hold the
+    /// title's bytes.
+    fn holds(&self, marks: &[(usize, u64, u64)], theirs: &[usize]) {
+        let base = self.start as usize / PAGE;
+        let quiet = {
+            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            quieted(&mut copied, base, marks, theirs)
+        };
+        if quiet != 0 {
+            QUIET_BACK[0].fetch_add(quiet, Ordering::Relaxed);
+            QUIET_BACK[1].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// The pages [`Shadow::holds`] notes current: `copied`, per page from
+/// `base` on, the asking of its last taking; `marks` the pages the
+/// copy-back wrote (page, the asking that had last found it written, this
+/// one); `theirs` the pages the title wrote into too. A page is quieted
+/// when the copy had taken it (`copied` not 0) and had taken its last
+/// write before ours (`before <= copied`), and the title did not write
+/// there too. Returns how many.
+fn quieted(copied: &mut [u64], base: usize, marks: &[(usize, u64, u64)], theirs: &[usize]) -> u64 {
+    let mut quiet = 0;
+    for &(page, before, now) in marks {
+        if theirs.contains(&page) {
+            continue;
+        }
+        if let Some(held) = page.checked_sub(base).and_then(|i| copied.get_mut(i))
+            && *held != 0
+            && before <= *held
+        {
+            *held = now;
+            quiet += 1;
+        }
+    }
+    quiet
 }
 
 struct Entry {

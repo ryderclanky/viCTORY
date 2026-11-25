@@ -17,10 +17,10 @@ Run these commands from the repository root in PowerShell:
 ```powershell
 rustup show
 cargo xtask install-hooks
-cargo test --workspace --locked
-cargo clippy --workspace --all-targets --locked
-cargo build --locked --release -p victory
-cargo build --locked --profile diag -p victory --features diagnostics
+cargo test --workspace --locked -j 1 -- --test-threads=1
+cargo clippy --workspace --all-targets --locked -j 1
+cargo build --locked --release -p victory -j 1
+cargo build --locked --profile diag -p victory --features diagnostics -j 1
 ```
 
 The release executable is `target\release\victory.exe`; the diagnostics executable is `target\diag\victory.exe`. Diagnostics builds include debug logging and additional runtime instrumentation. Build outputs stay under the ignored `target` directory.
@@ -40,6 +40,7 @@ The local run used a diagnostics build and the authorized executable path resolv
 | Follow-up run, intro artwork around 87 s | Renderer meter: 20.1 fps / 49.6 ms per frame | 10 | Same switch profile plus `VICTORY_CARD_BUFFERS_MB=256`; fully rendered intro artwork. Nearby frame-log windows had 33–39 ms medians and 213–3,110 ms long frames. |
 | Follow-up black transition window | Median 424 ms; max 3,902 ms | Not recorded | Followed the intro artwork. |
 | Follow-up next five-frame window | Median 424 ms; max 3,378 ms | Not recorded | Transition remained black. |
+| Later passive observation, credits artwork | About 3 fps / 319.5 ms per frame | 3,342 | Settings and build unknown. The user reported a crash while saw-like audio remained audible; no crash report or dump was collected, so the failure path is unknown. |
 
 Frame rates and draws above are title/runtime instrumentation. They are scene-local observations and must not be used as evidence of world rendering, playability, or a performance improvement. The memory readings below are approximate snapshots during startup/loading, not controlled steady-state samples:
 
@@ -95,6 +96,44 @@ $env:VICTORY_KEYS = '30:Enter,35:X'
 Remove-Item Env:VICTORY_KEYS, Env:VICTORY_FRAME_LOG -ErrorAction SilentlyContinue
 ```
 
+Three switches are worth knowing before a run:
+
+- `VICTORY_AMBIENT=<level>` (off unless set): the indirect diffuse light the title's rays would
+  have filled is replaced with a constant right after the program that resolves it. `=off`
+  restores the title's output, `=0` gives no indirect light, and a number sets the floor.
+  `VICTORY_AMBIENT_TINT=r,g,b` and `VICTORY_AMBIENT_SHADE=strength,radius,near,tan` tune
+  colour and depth-only occlusion. This is experimental and its visual result is unverified on
+  this PC because the run did not reach gameplay.
+- `VICTORY_BVH_EMPTY=1` (off): a program that tests rays against the ray-tracing structures is
+  translated so every test misses. The traversal leaves after one node and the sun lights what
+  would have been shadowed; it is the other candidate for lit interiors and needs its own run.
+- `VICTORY_DISPATCH_SPLIT=1` (off): a console dispatch of more than 65,535 thread groups is run
+  in slices, including a single indirect dispatch record whose shader reads the X group id.
+  Multi-record indirect windows are not split.
+- `VICTORY_CLAMP_AHEAD=1` (off): eligible single indirect records are clamped in a command
+  list's prelude as a batch instead of adding a clamp pass before each draw. The batch behavior
+  has a WARP test; game timing and rendering effects are unmeasured.
+
+Memory controls with no value set:
+
+- On a machine with less than 8,192 MiB of DXGI video-memory budget, or at most 20 GiB of
+  physical RAM, `VICTORY_PROFILE` selects smaller-card defaults: target reserve is a quarter of
+  the budget (512–3,072 MiB), texture room is 92%, on-demand texture mips are enabled, and the
+  staging pool is 64 MiB when RAM is at most 20 GiB. `VICTORY_PROFILE=0` or `=large` keeps the
+  shipped defaults; `=small` forces the small profile. These defaults have not been validated
+  in a gameplay run on this PC.
+- `VICTORY_TEXTURE_REFILL=<count>` limits new copies made through the indexed-texture queue per
+  frame; existing host copies can still be refreshed. Copies created outside that queue are
+  counted but not deferred by this limit. The default is off.
+- `VICTORY_TEXTURE_EVICT_AFTER=<frames>` releases the oldest eligible texture copies only when
+  measured VRAM use exceeds the queue's budget line. `VICTORY_TARGETS_ROOM_SHRINK=<frames>`
+  releases unused target reserve after target creation has gone quiet. Both are off by default.
+- `VICTORY_VRAM_IDLE_BY_ROOM=0` restores the former idle timeout based only on VRAM share. By
+  default, the timeout follows whether the texture queue itself can accept another copy.
+
+The memory defaults are sized from the machine at startup (`VICTORY_PROFILE=0` keeps the
+shipped ones; see the README section "Memory, sized to the machine it runs on").
+
 `VICTORY_FRAME_LOG=1` prints five-second summaries including frame count, shortest/median/longest frame times, individual frame times, the usual-frame breakdown, and separate long-frame breakdowns. This logging is enabled by default in diagnostics builds; the environment variable makes the measurement intent explicit. It adds instrumentation, so record that the run used a diagnostics build and compare like-for-like builds.
 
 For diagnostics screenshots, create the output folder before launch; the capture code does not create it automatically:
@@ -107,7 +146,7 @@ $env:VICTORY_CAPTURE_WORLD = '1'
 $env:VICTORY_CAPTURE_WORLD_EVERY = '256'
 ```
 
-On this 16 GB RAM / 8 GB VRAM laptop, the follow-up run used `VICTORY_CARD_BUFFERS_MB=256` and `VICTORY_STAGING_POOL=0`; optional card windows, upload windows and in-place pinning remained off. This conservative profile still became memory pressured and did not reach gameplay. The tried switch profile is the README's run 253 environment set, plus the 256 MiB card-buffer cap; it is an experiment, not a recommended performance preset. The 16 GB system memory and descriptor-heap limit remain blockers for this title on this PC.
+On this 16 GB RAM / 8 GB VRAM laptop, the follow-up run used `VICTORY_CARD_BUFFERS_MB=256` and `VICTORY_STAGING_POOL=0`; optional card windows, upload windows and in-place pinning remained off. This conservative profile still became memory pressured and did not reach gameplay. The tried switch profile is the README's run 253 environment set, plus the 256 MiB card-buffer cap; it is an experiment, not a recommended performance preset. The 16 GB system memory and descriptor-heap limit remain blockers for this title on this PC. The newer adaptive-memory defaults and other pending worktree changes have not been measured in the same scene, so they do not yet establish an improvement over those observations.
 
 ## Record a comparable run
 
@@ -133,4 +172,6 @@ These system memory observations are separate from the renderer's per-frame timi
 
 ## Current verification limits
 
-The release and diagnostics builds passed, and the local diagnostics run reached the opening intro/title card. Gameplay and world rendering were not reached; their compatibility, stability, FPS and frame times remain unverified. The startup performance readings are instrumented, incomplete and memory pressured; they are not a gameplay baseline. The README's gameplay measurements describe a different test machine and are not a baseline for this PC.
+On the current working tree, `cargo test --workspace --locked -j 1 -- --test-threads=1` passed with 616 tests passed, 12 ignored and 0 failed. Both `cargo build --locked --profile diag -p victory --features diagnostics -j 1` and `cargo build --locked --release -p victory -j 1` passed. `git diff --check` passed. Clippy and a clean `cargo fmt --all -- --check` result were not established.
+
+The release and diagnostics builds passed, and the local diagnostics run reached the opening intro/title card. Gameplay and world rendering were not reached; their compatibility, stability, FPS and frame times remain unverified. The startup performance readings are instrumented, incomplete and memory pressured; they are not a gameplay baseline. The README's gameplay measurements describe a different test machine and are not a baseline for this PC. The later 3 fps credits-artwork sample had unknown settings and is not comparable to those earlier runs.

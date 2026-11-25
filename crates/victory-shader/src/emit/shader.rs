@@ -51,6 +51,61 @@ pub const SLOT_FAULTS: u8 = 253;
 pub const MEMORY_PAGES: u32 = 1 << 21;
 /// Dwords of the [`SLOT_FAULTS`] buffer.
 pub const MEMORY_FAULTS: u32 = 4096;
+/// The `dx.types.ResourceProperties` word of the copy views above when they
+/// are made as handles: kind 11 (raw buffer) and bit 12,
+/// `DxilResourceProperties::BasicProps::IsUAV`. `dxc` writes `0x100B` for an
+/// `RWByteAddressBuffer`.
+pub const MEMORY_UAV_PROPS: u32 = 11 | 0x1000;
+/// `DxilResourceProperties::BasicProps::IsGloballyCoherent`: byte 1, bit 6 of
+/// the properties word of `dx.op.annotateHandle` (base alignment in bits 0 to
+/// 3, UAV bit 12, `IsROV` 13, this 14, sampler comparison or counter 15). A
+/// resource the module declares carries the same fact as the `i1
+/// globallyCoherent` field of its `dx.resources` record; the copy views are
+/// heap views (`createHandleFromHeap`) and have no such record. Measured with
+/// the Windows SDK's `dxc.exe` (1.8.2502): `globallycoherent
+/// RWByteAddressBuffer` gives `20491` (`0x500B`), the same buffer without it
+/// `4107` (`0x100B`), and `PSV0` and `SFI0` are byte-identical either way
+/// (`SFI0` has no bit for coherency).
+pub const GLOBALLY_COHERENT: u32 = 0x4000;
+
+/// `VICTORY_COHERENT_MEM=1`: the view a title-memory access reads and writes
+/// ([`SLOT_MEMORY`], `lower.rs` `Lower::memory`) is declared globally
+/// coherent ([`GLOBALLY_COHERENT`]) instead of an ordinary raw UAV, and only
+/// that view: every other raw UAV the program makes keeps its own properties.
+///
+/// XCL, a sibling layer, needed this for the ray-tracing structure builder:
+/// without the flag one dispatch's stores through the same copies were not
+/// ordered with another dispatch's loads, and the builder wrote wrong child
+/// pointers (`shortcut:` their finding, not ours). **We have not run it**: no
+/// run of ours has shown the builder write a wrong pointer, and on D3D12 the
+/// flag is a hint a driver may ignore, since ordering between dispatches there
+/// comes from a UAV barrier. Off by default: the flag asks the driver for
+/// ordering on every access through that view, and that costs wherever it is
+/// not needed.
+fn coherent_mem_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_COHERENT_MEM.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COHERENT_MEM").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`coherent_mem_on`], for its thread only.
+    static TEST_COHERENT_MEM: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// The properties of the raw UAV handle a title-memory access makes: see
+/// [`MEMORY_UAV_PROPS`] and [`coherent_mem_on`].
+pub fn memory_uav_props() -> (u32, u32) {
+    if coherent_mem_on() {
+        (MEMORY_UAV_PROPS | GLOBALLY_COHERENT, 0)
+    } else {
+        (MEMORY_UAV_PROPS, 0)
+    }
+}
 /// `RootType::Other` code of a user-data dword the host computes: the view
 /// heap slot of the memory copies' views ([`SLOT_MEMORY`]).
 pub const USER_MEMORY_BASE: u32 = 0x100;
@@ -69,6 +124,12 @@ pub const USER_VIEW_ADDRESS: u32 = 0x101;
 /// view. Asked for every root UAV, and for the root SRVs of programs with
 /// a spilled user-data table.
 pub const USER_VIEW_BIAS: u32 = 0x103;
+
+/// `RootType::Other` code of a user-data dword the host computes: the first thread group of the
+/// console's dispatch that this host dispatch runs (`VICTORY_DISPATCH_SPLIT`), 0 for the first
+/// slice of it. A console dispatch may ask for more groups than the host runs in one go; the
+/// translated program's `SV_GroupID.x` is the host's plus this.
+pub const USER_GROUP_BASE: u32 = 0x104;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
@@ -408,7 +469,14 @@ impl Shader {
         let index = if !sampler && limit != 0 {
             let null = self.m.i32(limit);
             let i32t = self.t.i32;
-            let v = self.op(block, "binary.i32", Attr::ReadNone, i32t, 40, &[index, null]);
+            let v = self.op(
+                block,
+                "binary.i32",
+                Attr::ReadNone,
+                i32t,
+                40,
+                &[index, null],
+            );
             self.m.tag(v, super::bitcode::Tag::Clamp);
             v
         } else if sampler {
@@ -419,7 +487,14 @@ impl Shader {
             // heap smaller than 2,048 would need.
             let last = self.m.i32(2047);
             let i32t = self.t.i32;
-            let v = self.op(block, "binary.i32", Attr::ReadNone, i32t, 40, &[index, last]);
+            let v = self.op(
+                block,
+                "binary.i32",
+                Attr::ReadNone,
+                i32t,
+                40,
+                &[index, last],
+            );
             self.m.tag(v, super::bitcode::Tag::Clamp);
             v
         } else {
@@ -886,5 +961,76 @@ impl Shader {
             list.push(Some(self.m.md_node(ops)));
         }
         Some(self.m.md_node(list))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::bitcode::Term;
+    use super::*;
+
+    /// A compute shader that stores through one raw UAV handle made with
+    /// `props` and, when `memory`, through another made as the title-memory
+    /// access makes it. The stores keep both handles alive through the
+    /// clean-up in `finish`.
+    fn emit(memory: bool) -> Vec<u8> {
+        let mut s = Shader::new(false);
+        s.threads = Some([1, 1, 1]);
+        s.user_data = 4;
+        let entry = s.entry;
+        let (i32t, void) = (s.t.i32, s.t.void);
+        let (iu, zero) = (s.m.undef(i32t), s.m.i32(0));
+        let (mask, align) = (s.m.i8(1), s.m.i32(4));
+        let through = |s: &mut Shader, props: (u32, u32)| {
+            let h = s.heap_handle(entry, zero, false, true, props);
+            s.op(
+                entry,
+                "rawBufferStore.i32",
+                Attr::NoUnwind,
+                void,
+                140,
+                &[h, zero, iu, zero, iu, iu, iu, mask, align],
+            );
+        };
+        if memory {
+            through(&mut s, memory_uav_props());
+        }
+        through(&mut s, (MEMORY_UAV_PROPS, 0));
+        s.m.terminate(entry, Term::Ret);
+        s.finish()
+    }
+
+    #[test]
+    fn the_memory_uav_is_coherent_only_under_the_switch() {
+        let was = TEST_COHERENT_MEM.replace(Some(false));
+        let plain = (memory_uav_props(), emit(true));
+        let unread = emit(false);
+        TEST_COHERENT_MEM.set(Some(true));
+        let coherent = (memory_uav_props(), emit(true));
+        let unread_coherent = emit(false);
+        TEST_COHERENT_MEM.set(was);
+        // The word `dxc` writes for a `globallycoherent RWByteAddressBuffer`
+        // and for a plain one.
+        assert_eq!(plain.0, (0x100B, 0));
+        assert_eq!(coherent.0, (0x500B, 0));
+        // The switch reaches the module through the memory handle and
+        // nowhere else: a shader with no memory access is byte-identical.
+        assert_ne!(plain.1, coherent.1);
+        assert_eq!(unread, unread_coherent);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn the_coherent_properties_pass_dxil_validation() {
+        let was = TEST_COHERENT_MEM.replace(Some(true));
+        let mut container = emit(true);
+        TEST_COHERENT_MEM.set(was);
+        let path = super::super::validator::Validator::default_path();
+        let Ok(mut validator) = super::super::validator::Validator::load(path.as_deref()) else {
+            return;
+        };
+        validator
+            .validate(&mut container)
+            .expect("DXIL validation failed");
     }
 }

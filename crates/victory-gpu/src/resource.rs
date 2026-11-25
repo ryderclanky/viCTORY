@@ -1276,6 +1276,21 @@ pub(crate) fn title_fills(this: This) -> bool {
     !this.is_null() && fills(&resource(this).desc)
 }
 
+/// Whether title texture `this` already has its host copy, without making
+/// it or counting this queue's check as a use.
+#[cfg(windows)]
+pub(crate) fn host_exists(this: This) -> bool {
+    if this.is_null() || resource(this).desc.dimension == BUFFER {
+        return false;
+    }
+    resource(this)
+        .host
+        .made
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_some()
+}
+
 /// Whether `this` is a texture whose host copy is not made yet (and may
 /// still be): a descriptor slot written with a view of it waits
 /// (`crate::descriptor::make_waiting`).
@@ -1383,6 +1398,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         }
         KINDS[6].fetch_add(1, Relaxed);
         *made = Some((std::sync::Arc::new(host), twin));
+        refill_made();
         // Slots the title wrote with views of it while it had no host copy
         // are made before the next submission runs.
         crate::descriptor::texture_made(this as usize);
@@ -1460,6 +1476,19 @@ pub(crate) fn room() -> bool {
 /// 238), and the queue was refused from the first world frame on. With
 /// their room kept, the queue stops that much earlier while the world
 /// loads and gets it back as the targets are made.
+///
+/// It gets it back only as far as the targets go: what the world does not
+/// make stays kept for it. The reference's own census (run ve135) found
+/// 1,420 MB of targets two minutes into the world and 1,650 MB still kept
+/// for the ones never made, and on an 8 GB card the quarter is 1,625 MB of
+/// a 6,500 MB budget — a quarter of the card the queue cannot fill while
+/// thousands of textures wait and the sweep churns.
+///
+/// `VICTORY_TARGETS_ROOM_SHRINK=<frames>` hands the rest to the queue once
+/// the world has stopped making targets (see [`targets_room_gone`]): the
+/// reserve then stays as it is while the title makes more (a growth of
+/// 64 MiB arms the countdown again), and nothing is held for a world that
+/// has moved on.
 #[cfg(windows)]
 pub(crate) fn targets_room_kept() -> u64 {
     use std::sync::atomic::Ordering::Relaxed;
@@ -1468,11 +1497,81 @@ pub(crate) fn targets_room_kept() -> u64 {
         std::env::var("VICTORY_CARD_ROOM_FOR_TARGETS_MB")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(3072 << 20, |mb| mb.min(8192) << 20)
+            .map_or(crate::tuning::profile().targets_room_mb << 20, |mb| {
+                mb.min(8192) << 20
+            })
     });
     // Every host texture's bytes less those of the copies the title fills.
     let targets = HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed));
-    most.saturating_sub(targets)
+    let kept = most.saturating_sub(targets);
+    let Some(frames) = shrink_after() else {
+        return kept;
+    };
+    // The most targets seen, the frame that most last grew by `GROWN_BY`,
+    // and whether the reserve has gone to the queue.
+    const GROWN_BY: u64 = 64 << 20;
+    static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static GREW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static SHARED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let frame = crate::frame::current();
+    let seen = SEEN.load(Relaxed);
+    if targets > seen + GROWN_BY {
+        SEEN.store(targets, Relaxed);
+        GREW.store(frame, Relaxed);
+        if SHARED.swap(false, Relaxed) {
+            tracing::info!(
+                targets_mb = targets >> 20,
+                "targets room: the world makes render targets again, so some is kept for them again \
+                 (VICTORY_TARGETS_ROOM_SHRINK)"
+            );
+        }
+    }
+    if SHARED.load(Relaxed) {
+        return 0;
+    }
+    if !targets_room_gone(most, targets, frame.saturating_sub(GREW.load(Relaxed)), frames) {
+        return kept;
+    }
+    SHARED.store(true, Relaxed);
+    if !SAID.swap(true, Relaxed) {
+        tracing::info!(
+            kept_mb = kept >> 20,
+            targets_mb = targets >> 20,
+            most_mb = most >> 20,
+            frames,
+            "targets room: the world has made no new render target for that many frames: what was kept \
+             for the ones it does not make is the texture queue's again (VICTORY_TARGETS_ROOM_SHRINK)"
+        );
+    }
+    0
+}
+
+/// The frames the world may make no render target for before the room kept
+/// for the ones it will not make is the queue's: `VICTORY_TARGETS_ROOM_SHRINK`
+/// (0 or absent: off, and the room is kept for the rest of the run).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn shrink_after() -> Option<u64> {
+    static FRAMES: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *FRAMES.get_or_init(|| {
+        let frames = std::env::var("VICTORY_TARGETS_ROOM_SHRINK")
+            .ok()?
+            .trim()
+            .parse::<u64>()
+            .ok()?;
+        (frames > 0).then(|| frames.clamp(8, 100_000))
+    })
+}
+
+/// Whether the room kept for targets not made yet goes to the queue: the
+/// world has made at least a quarter of it and then stopped for `frames`
+/// frames. A quarter is what the reference's census saw before the world
+/// (652 MB of 3,072) and more than it saw after the first frame, so a
+/// countdown that ran out having made less than that is a run that has not
+/// reached the world yet.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn targets_room_gone(most: u64, targets: u64, since_growth: u64, frames: u64) -> bool {
+    targets >= most / 4 && since_growth >= frames
 }
 
 /// [`room`] as it was at most a tenth of a second ago, for a question
@@ -1507,8 +1606,110 @@ fn room_percent() -> u64 {
         std::env::var("VICTORY_TEXTURE_ROOM_PERCENT")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(90, |percent| percent.clamp(50, 97))
+            .map_or(crate::tuning::profile().room_percent, |percent| {
+                percent.clamp(50, 97)
+            })
     })
+}
+
+/// For [`refill_most`]: the frame these counts are of, the host copies made
+/// in it, and the copies the queue held back in it.
+#[cfg(windows)]
+static REFILL: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(u64::MAX) }; 3];
+
+/// The most host copies a frame makes: `VICTORY_TEXTURE_REFILL` (0 or
+/// absent: no count).
+///
+/// The queue's budget is bytes — 192 MB a frame, three times that while a
+/// backlog drains (`VICTORY_TEXTURE_STAGE_MB`, `_CATCHUP`) — which at the
+/// sizes a world's textures come in is thousands of copies in one frame.
+/// Making and staging 192 MB took 1.6 to 2.2 s of each of the world's first
+/// twenty frames (run 20), and a frame that spends that leaves the ones
+/// after it further behind. A count per frame spreads the same refill over
+/// more frames.
+///
+/// The count is enforced by the queue, which holds a slot back a frame
+/// instead of making its copy (`draw.rs` `heap_textures`, one call to
+/// [`refill_room`] before the copy is made). Every copy made is counted
+/// wherever it is made ([`refill_made`], from [`hosted`]), so the frame's
+/// line says what this machine makes with the switch on and off — which is
+/// what `M` is chosen by.
+fn refill_most() -> Option<u64> {
+    static MOST: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        let most = std::env::var("VICTORY_TEXTURE_REFILL")
+            .ok()?
+            .trim()
+            .parse::<u64>()
+            .ok()?;
+        (most > 0).then(|| most.clamp(1, 4_096))
+    })
+}
+
+/// Whether `VICTORY_TEXTURE_REFILL` sets a per-frame limit for host copies
+/// made by the indexed-texture queue.
+#[cfg(windows)]
+pub(crate) fn refill_active() -> bool {
+    refill_most().is_some()
+}
+
+/// Rolls the frame's counts over and says them: the copies the frame before
+/// made and the ones it held back.
+#[cfg(windows)]
+fn refill_frame() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let frame = crate::frame::current();
+    let counted = REFILL[0].swap(frame, Relaxed);
+    if counted != frame {
+        let (made, held) = (REFILL[1].swap(0, Relaxed), REFILL[2].swap(0, Relaxed));
+        if made > 0 || held > 0 {
+            tracing::info!(
+                frame = counted,
+                made,
+                held,
+                most = refill_most().unwrap_or(0),
+                "texture refill: the host copies the frame made and the ones the queue held back for the \
+                 next (VICTORY_TEXTURE_REFILL)"
+            );
+        }
+    }
+}
+
+/// Whether the queue may make one more host copy this frame: fewer than
+/// [`refill_most`] were made. Each `false` counts a copy held back, and the
+/// frame's line then says how many — a shortage spread over frames shows as
+/// a steady `held` rather than as a frame of hundreds of milliseconds.
+#[cfg(windows)]
+pub(crate) fn refill_room() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    let Some(most) = refill_most() else {
+        return true;
+    };
+    refill_frame();
+    if refill_takes(REFILL[1].load(Relaxed), most) {
+        return true;
+    }
+    REFILL[2].fetch_add(1, Relaxed);
+    false
+}
+
+/// Whether one more copy fits in a frame that has made `made` of a budget
+/// of `most`.
+#[allow(dead_code)]
+fn refill_takes(made: u64, most: u64) -> bool {
+    made < most
+}
+
+/// Notes one host copy made in this frame ([`refill_most`]).
+#[cfg(windows)]
+pub(crate) fn refill_made() {
+    use std::sync::atomic::Ordering::Relaxed;
+    if refill_most().is_none() {
+        return;
+    }
+    refill_frame();
+    REFILL[1].fetch_add(1, Relaxed);
 }
 
 /// For the card accounting line ([`card_accounting`]): the title texture
@@ -1728,6 +1929,80 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
     }
 }
 
+/// The frames a host copy may go unused for a sweep under pressure to let
+/// it go: `VICTORY_TEXTURE_EVICT_AFTER` (0 or absent: off, and the sweep
+/// keeps its idle rule).
+///
+/// Off, a copy goes once the idle time has passed, whichever copy it is:
+/// on the reference machine's runs the layer sat at 9.0 of a 10.2 GB budget
+/// and let go and made again 44,613 textures in 13 minutes, each made and
+/// uploaded a second time at its next use. With the switch, the sweep frees
+/// only what the shortage needs, from copies nothing has used for `frames`
+/// frames and the oldest first, and nothing at all while the card has room:
+/// at 8-10 fps on this machine 120 frames is 12 to 15 seconds of a texture
+/// being out of sight, where the idle rule took it after one.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn evict_after() -> Option<u64> {
+    static FRAMES: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *FRAMES.get_or_init(|| {
+        let frames = std::env::var("VICTORY_TEXTURE_EVICT_AFTER")
+            .ok()?
+            .trim()
+            .parse::<u64>()
+            .ok()?;
+        // (Below 8 frames the switch is the idle rule with a longer name:
+        // no copy a frame may still be reading goes.)
+        (frames > 0).then(|| frames.clamp(8, 3_600))
+    })
+}
+
+/// A host copy a sweep may let go: its title texture, when it was last used
+/// (`crate::host::moment`), the bytes it holds, whether nothing has used it
+/// for the idle time, and whether nothing has used it for the eviction
+/// switch's frames ([`evict_after`]).
+#[cfg_attr(not(windows), allow(dead_code))]
+struct Going {
+    at: usize,
+    used: u64,
+    bytes: u64,
+    idle: bool,
+    cold: bool,
+}
+
+/// The copies of `copies` to let go: every idle one as before, or, under
+/// pressure (`need` is what the card is over its line by), the cold ones
+/// oldest first until their bytes cover it — no more than that, so that
+/// what a later frame uses is still on the card.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn let_go_which(copies: &[Going], need: Option<u64>) -> Vec<usize> {
+    let Some(need) = need else {
+        return copies.iter().filter(|c| c.idle).map(|c| c.at).collect();
+    };
+    let mut cold: Vec<&Going> = copies.iter().filter(|c| c.cold).collect();
+    cold.sort_by_key(|c| c.used);
+    let mut covered = 0u64;
+    cold.into_iter()
+        .take_while(|c| {
+            let more = covered < need;
+            covered += c.bytes;
+            more
+        })
+        .map(|c| c.at)
+        .collect()
+}
+
+/// The bytes the card's memory in use is over the line the texture queue
+/// fills to ([`room`]): what a sweep under pressure wants back. `None` when
+/// the card's budget cannot be read (a hosted runner), where the idle rule
+/// is all the sweep has to go by.
+#[cfg(windows)]
+fn shortage(video: Option<[u64; 4]>) -> Option<u64> {
+    let [budget, used, ..] = video?;
+    // The reserves count as used, as they do in `room`.
+    let over = used + crate::shadow::card_room_kept() + targets_room_kept();
+    Some(over.saturating_sub(budget / 100 * room_percent()))
+}
+
 /// Lets go of the host copies of textures the title fills that nothing
 /// names any more: placed textures were never released (one host texture
 /// per address and description ever viewed: 18,639 of them, 2.5 GB, after
@@ -1740,7 +2015,19 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
 /// - only the host copy holds the host texture: no descriptor slot views
 ///   it (a slot keeps what it views, `HostHeap::kept`), so no shader can
 ///   read it through a slot made earlier, by a table or by an index;
-/// - nothing asked for it for `IDLE_MS` and `IDLE_FRAMES` frames.
+/// - and nothing asked for it for the idle time and `IDLE_FRAMES` frames:
+///   5 seconds while the texture queue has room, less when it has none
+///   (`crate::host::vram_idle_ms_by_room`). By the share of the budget
+///   alone, the queue's own line of 92 % left every copy with 1 second,
+///   which is the churn the reference recorded (46,803 copies, 11.4 GB, in
+///   200 seconds while the card had room).
+///
+/// With `VICTORY_TEXTURE_EVICT_AFTER=<frames>` ([`evict_after`]) the last
+/// rule is a budget instead: while the card is over its line, the cold
+/// copies (nothing has used them for that many frames) go oldest first
+/// until the excess is covered, and while it has room nothing goes. A copy
+/// a draw needs next frame is then usually still there, and the copy that
+/// is not is made once, from title memory.
 ///
 /// The next use makes the host copy anew and uploads the title's memory
 /// again (its staging state goes with it). The title resource stays: its
@@ -1749,7 +2036,13 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
 /// it; a thread that asked for it and has not yet recorded its use (which
 /// makes the list or the slot hold it) is protected by that idle time alone.
 /// Every caller uses it at once, within the title's call.
-/// Called before a submission starts, by the thread that submits.
+/// shortcut: the system reports a card's memory as used for a moment after
+/// a copy let go is released, and the release itself waits for the lists
+/// running (`crate::host::retire`), so a sweep may take copies for a
+/// shortage the one before it has already covered. The oldest-first order
+/// and the frame threshold bound that to one extra sweep's worth.
+/// Called before a submission starts, by the thread that submits, once a
+/// second (`crate::host::sweep`).
 /// `VICTORY_TEXTURE_SWEEP=0` lets nothing go.
 #[cfg(windows)]
 pub(crate) fn let_go_idle() {
@@ -1759,26 +2052,69 @@ pub(crate) fn let_go_idle() {
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
         return;
     }
-    let idle_ms = crate::host::vram_idle_ms(crate::host::host().and_then(|h| h.video_memory()));
-    // For the trail (`crate::host::trail`): how many went, their bytes,
-    // and the first one.
-    let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
+    let video = crate::host::host().and_then(|h| h.video_memory());
+    let room = room();
+    let idle_ms = crate::host::vram_idle_ms_by_room(video, room);
+    // Off, `need` is `None` and the idle copies go as before. On, the card's
+    // shortage in bytes is what the sweep aims at: nothing while it has
+    // room, and with no budget to measure the shortage by (a hosted runner)
+    // nothing either, and the idle rule applies.
+    let after = evict_after();
+    let need = if after.is_some() { shortage(video) } else { None };
+    // Every copy the sweep may take, and of those how many are idle and how
+    // many cold: the takes themselves come after, under each texture's lock,
+    // and are what the trail and the line below count.
+    let mut going = Vec::new();
     let all = textures();
     for &at in all.iter() {
         // SAFETY: a texture leaves the table before it is freed, under the
-        // lock held here (`Drop for Resource`).
+        // lock taken here (`Drop for Resource`).
         let r = unsafe { &*(at as *const Resource) };
         if !fills(&r.desc) || crate::texture::host_wrote(at) {
             continue;
         }
+        let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((host, _)) = made.as_ref() else {
+            continue;
+        };
+        // Held by a list or a slot: not the sweep's to take.
+        if std::sync::Arc::strong_count(host) != 1 || crate::host::references(&host.texture) != 1 {
+            continue;
+        }
+        let used = r.host.used.load(Relaxed);
+        going.push(Going {
+            at,
+            used,
+            bytes: host.bytes,
+            idle: crate::host::long_ago(used, idle_ms, IDLE_FRAMES),
+            cold: after.is_some_and(|frames| crate::host::long_ago(used, 0, frames)),
+        });
+    }
+    let cold: u64 = going.iter().filter(|c| c.cold).map(|c| c.bytes).sum();
+    let cold_n = going.iter().filter(|c| c.cold).count() as u64;
+    let victims = let_go_which(&going, need);
+    // For the trail (`crate::host::trail`): how many went, their bytes,
+    // and the first one.
+    let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
+    for at in victims {
+        // SAFETY: as in the walk above.
+        let r = unsafe { &*(at as *const Resource) };
         let gone = {
             let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
-            let idle = made.as_ref().is_some_and(|(host, _)| {
-                crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)
-                    && std::sync::Arc::strong_count(host) == 1
-                    && crate::host::references(&host.texture) == 1
-            });
-            if idle {
+            // Asked again under the lock: a list or a slot may have taken it
+            // since, and something may have used it (the walk let the lock
+            // go between textures).
+            let used = r.host.used.load(Relaxed);
+            let still = match after {
+                Some(frames) => crate::host::long_ago(used, 0, frames),
+                None => crate::host::long_ago(used, idle_ms, IDLE_FRAMES),
+            };
+            let free = still
+                && made.as_ref().is_some_and(|(host, _)| {
+                    std::sync::Arc::strong_count(host) == 1
+                        && crate::host::references(&host.texture) == 1
+                });
+            if free {
                 // Under the lock: the next use must not find the staging
                 // state of the texture let go (it says "uploaded").
                 crate::texture::unstage(at as This);
@@ -1797,6 +2133,35 @@ pub(crate) fn let_go_idle() {
                 first = Some(at);
             }
             crate::host::retire(host);
+        }
+    }
+    if let Some(frames) = after {
+        // The frame's line: what went, what the shortage was, the cold
+        // copies there were to take (a shortage the sweep could not cover
+        // shows as more needed than taken), and the queue's side of it, the
+        // passes that made no texture for lack of room since the sweep
+        // before (`draw.rs` `HEAP_TEXTURES_FULL`). A texture a draw needs
+        // and cannot have is refused there, which is what this line is for.
+        static BEFORE_FULL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let full = crate::draw::HEAP_TEXTURES_FULL.load(Relaxed);
+        let refused = full.saturating_sub(BEFORE_FULL.swap(full, Relaxed));
+        if went > 0 || refused > 0 {
+            let need = need.unwrap_or(0);
+            tracing::info!(
+                frames,
+                let_go = went,
+                let_go_mb = bytes >> 20,
+                cold = cold_n,
+                cold_mb = cold >> 20,
+                need_mb = need >> 20,
+                targets_room_mb = targets_room_kept() >> 20,
+                room,
+                refused_passes = refused,
+                waiting = crate::draw::HEAP_TEXTURES_WAITING.load(Relaxed),
+                "texture eviction: the copies nothing used for that many frames that went to bring the card back under its line, \
+                 the shortage, the cold copies there were, and the passes that made no texture for lack of room \
+                 (VICTORY_TEXTURE_EVICT_AFTER)"
+            );
         }
     }
     if went > 0 {
@@ -4021,5 +4386,84 @@ float4 lit() : SV_Target { return 1.0; }
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    fn going(at: usize, used: u64, bytes: u64, idle: bool, cold: bool) -> Going {
+        Going {
+            at,
+            used,
+            bytes,
+            idle,
+            cold,
+        }
+    }
+
+    #[test]
+    fn the_idle_rule_takes_every_idle_copy_and_only_those() {
+        let copies = [
+            going(1, 10, 1_000, true, false),
+            going(2, 20, 1_000, false, false),
+            going(3, 5, 1_000, true, false),
+        ];
+        assert_eq!(let_go_which(&copies, None), vec![1, 3]);
+    }
+
+    #[test]
+    fn pressure_takes_the_oldest_cold_copies_until_the_shortage_is_covered() {
+        // Four cold copies of 1,000 bytes used in this order, and one in use
+        // now that is neither: a shortage of 2,500 takes three, the three
+        // oldest, and nothing else.
+        let copies = [
+            going(1, 40, 1_000, false, true),
+            going(2, 10, 1_000, false, true),
+            going(3, 30, 1_000, false, true),
+            going(4, 20, 1_000, false, true),
+            going(5, 99, 1_000, false, false),
+        ];
+        assert_eq!(let_go_which(&copies, Some(2_500)), vec![2, 4, 3]);
+    }
+
+    #[test]
+    fn pressure_takes_nothing_while_the_card_is_not_over_its_line() {
+        let copies = [going(1, 10, 1_000, true, true)];
+        assert_eq!(let_go_which(&copies, Some(0)), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn pressure_takes_every_cold_copy_when_the_shortage_is_larger_than_them() {
+        let copies = [
+            going(1, 30, 1_000, false, true),
+            going(2, 10, 1_000, false, true),
+            going(3, 20, 0, false, true),
+        ];
+        // A copy that holds nothing costs nothing: it goes last, and goes.
+        assert_eq!(let_go_which(&copies, Some(1 << 30)), vec![2, 3, 1]);
+    }
+
+    #[test]
+    fn a_frame_makes_its_refill_budget_and_holds_the_rest_back() {
+        let (most, asked) = (32u64, 500u64);
+        let (mut made, mut held) = (0u64, 0u64);
+        for _ in 0..asked {
+            if refill_takes(made, most) {
+                made += 1;
+            } else {
+                held += 1;
+            }
+        }
+        assert_eq!((made, held), (most, asked - most));
+        // A frame that asks for fewer than its budget makes all of them.
+        assert!(refill_takes(0, most) && refill_takes(most - 1, most));
+        assert!(!refill_takes(most, most));
+    }
+
+    #[test]
+    fn the_targets_room_goes_once_the_world_stops_making_targets() {
+        let most = 1_625 << 20;
+        assert!(targets_room_gone(most, most / 4, 600, 600));
+        // The same, ten seconds after a growth: not yet.
+        assert!(!targets_room_gone(most, most / 4, 4, 600));
+        // Less than a quarter made: the world has not been reached yet.
+        assert!(!targets_room_gone(most, most / 8, 10_000, 600));
     }
 }

@@ -26,7 +26,39 @@ developer or publisher.
   VIctory #1122 by tightfall. The read-beside fix for kernel reads into title
   memory is by **Joshua Odom** (commit `10ea38e` of the same fork family). Both
   are carried here unchanged apart from one merge conflict.
+- The ambient light pass (`crates/victory-gpu/src/ambient.rs`, and its hooks in
+  `draw.rs` and `pipeline.rs`) is **Belobug**'s, as **reddxd-byte**'s
+  [ShakiraRED-dt](https://github.com/reddxd-byte/ShakiraRED-dt) carries it (commit
+  `c2271e5`, GPL-3.0-or-later). It reached this tree through the "Neptune" edit of
+  VIctory that [AnyXboxX](https://github.com/LooperSalty/AnyXboxX) vendors in its
+  `third_party/victory`; the shader is unchanged, the host side is adapted to this
+  fork's list and pipeline types. It is opt-in with `VICTORY_AMBIENT=<level>`; this
+  PC has not reached gameplay, so its lighting effect here is unverified.
 - This fork's changes were developed with [Claude Code](https://claude.com/claude-code).
+
+## Memory, sized to the machine it runs on
+
+The numbers in the status section above were measured on a PC with 32 GB of memory and a
+12 GB card, where this layer holds about 24 GB, 16 GB of it resident, and the card runs at 9.0
+of a 10.2 GB budget. On a smaller machine that working set does not fit: Windows pages (one run
+on a 16 GB / 8 GB laptop wrote 17.9 GB to the page file), the driver's shader compiler fails
+with `ptxas fatal: Memory allocation failure`, host pipeline creation returns `0x8007000E`, and
+the title then traps in its own fatal handler.
+
+So the memory defaults are sized from what is there. At the first use of a memory knob the layer
+reads the system's physical memory and the card's DXGI budget once and logs one line,
+`the memory this machine has, and the defaults it sets`:
+
+| Knob | 32 GB / 10.2 GB budget | 16 GB / 6.5 GB budget |
+|------|------------------------|-----------------------|
+| `VICTORY_CARD_ROOM_FOR_TARGETS_MB` | 3,072 | a quarter of the budget (1,625) |
+| `VICTORY_TEXTURE_ROOM_PERCENT` | 90 | 92 |
+| `VICTORY_LEVELS_ON_DEMAND` | off | on |
+| `VICTORY_STAGING_POOL_MB` | 256 | 64 |
+
+Every value is still overridden by its own switch. `VICTORY_PROFILE=0` keeps the shipped
+defaults; `=small` and `=large` force one of the two profiles; nothing at all reads the machine,
+and a machine whose budget cannot be read gets the shipped defaults unchanged.
 
 ## Status of this fork (2026-11-25)
 

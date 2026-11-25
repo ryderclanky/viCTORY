@@ -607,6 +607,17 @@ impl TextureQueue {
         if let Some(w) = self.same(index, write) {
             w.due = frame + (1u64 << w.looks.min(16)).min(most.max(1));
             w.looks = w.looks.saturating_add(1);
+            // Its memory went away, or no more of it is mapped than was
+            // uploaded: whatever was noted of a whole upload of it is gone
+            // with it (`checked`). Kept, every look at the slot compares
+            // the fingerprint of a whole upload against memory that is not
+            // there any more and reports "changed after its upload" - 203
+            // times in run 193 for 130 slots, the same slot at 16, 17, 18,
+            // 21, 25, 33, 49, 81 frames after an upload that never
+            // happened again (each gap `later`'s own 1, 2, 4, 8, 16), with
+            // the record's `uploaded` frame and `looks` frozen so the
+            // recheck schedule of `RECHECK_FRAMES` never moved on.
+            w.checked = (0, 0, 0, 0, 0);
         }
     }
 
@@ -646,6 +657,10 @@ impl TextureQueue {
     fn partly(&mut self, index: u32, write: u64, due: u64, mapped: u64) {
         if let Some(w) = self.same(index, write) {
             (w.due, w.looks, w.mapped) = (due, 0, mapped.max(1));
+            // As in [`TextureQueue::later`]: not a whole upload any more,
+            // so the record of one describes a fingerprint and a frame the
+            // slot no longer has.
+            w.checked = (0, 0, 0, 0, 0);
         }
     }
 
@@ -3322,6 +3337,36 @@ mod tests {
         q.written(98, 14, 16, false);
         assert!(!q.due(15, 100).iter().any(|d| d.0 == 98));
         assert!(q.due(16, 100).iter().any(|d| d.0 == 98));
+    }
+
+    /// A slot uploaded whole and then found not to be there any more (or
+    /// with less of it than was uploaded) is no whole upload to be checked
+    /// any more: the record of one goes with the memory it described. Kept,
+    /// every look at the slot compared a fingerprint of the whole against
+    /// what was left and reported the texture changed after its upload: 203
+    /// such reports in run 193, one slot at 16, 17, 18, 21, 25, 33, 49 and
+    /// 81 frames after its upload (each gap `later`'s own 1, 2, 4, 8, 16),
+    /// with the record's upload frame and look count frozen so the recheck
+    /// schedule of `RECHECK_FRAMES` never moved on.
+    #[test]
+    fn a_slot_with_nothing_to_upload_keeps_no_whole_upload_record() {
+        let mut q = TextureQueue::default();
+        q.written(7, 1, 0, false);
+        let write = q.due(1, 100).into_iter().find(|d| d.0 == 7).unwrap().1;
+        q.recheck(7, write, 5, (0x1000, 4096), 0xabcd, 0, 1);
+        assert_eq!(q.checked(7), Some((0x1000, 4096, 0xabcd, 0, 1)));
+        // Its memory went: looked at again in 1, 2, 4 frames, with no whole
+        // upload at a fingerprint behind it.
+        q.later(7, write, 5, 64);
+        assert_eq!(q.checked(7), None);
+        // As with an upload of it in part.
+        q.recheck(7, write, 5, (0x1000, 4096), 0xabcd, 1, 9);
+        assert!(q.checked(7).is_some());
+        q.partly(7, write, 6, 2048);
+        assert_eq!(q.checked(7), None);
+        // A slot still waiting for its whole upload unchanged keeps it.
+        q.recheck(7, write, 8, (0x1000, 4096), 0xabcd, 2, 9);
+        assert!(q.checked(7).is_some());
     }
 
     /// Slots held back for lack of room on the card are not handed out
