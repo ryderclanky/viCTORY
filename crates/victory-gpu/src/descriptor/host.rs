@@ -790,15 +790,32 @@ pub(crate) fn near_heaps(va: u64) -> String {
     text
 }
 
-/// The host's limit for shader-visible view heaps on resource binding
-/// tiers 1 and 2; tier 3 hardware may take more.
+/// Safe fallback for shader-visible view heaps when neither larger probe
+/// succeeds. It is the limit on resource binding tiers 1 and 2.
 const PORTABLE_VIEWS: u32 = 1_000_000;
 
+/// Enough slots for the observed title heap (1,245,184), [`DYNAMIC`], and
+/// the null slot, with 65,535 slots left over. Some adapters reject the
+/// larger heap but accept this size.
+const INTERMEDIATE_VIEWS: u32 = 1_572_864;
+
 /// The size of every host view heap on a host that takes more than
-/// [`PORTABLE_VIEWS`] (AMD): the title's heap (a little over 1,000,000
-/// views in the retail game) plus [`DYNAMIC`] fits with room to spare, and
-/// the last slot is the null slot every view index at or past it reads.
+/// [`INTERMEDIATE_VIEWS`]: the last slot is the null slot every view index
+/// at or past it reads.
 const UNCAPPED_VIEWS: u32 = 1 << 21;
+
+/// Try the candidate capacities in descending order. The portable fallback
+/// is retained even when probing larger heaps fails.
+fn select_view_heap_size<E>(mut probe: impl FnMut(u32) -> Result<(), E>) -> (u32, Vec<(u32, E)>) {
+    let mut failures = Vec::new();
+    for size in [UNCAPPED_VIEWS, INTERMEDIATE_VIEWS] {
+        match probe(size) {
+            Ok(()) => return (size, failures),
+            Err(error) => failures.push((size, error)),
+        }
+    }
+    (PORTABLE_VIEWS, failures)
+}
 
 /// Picks, once, the null slot at the end of every host view heap and tells
 /// the translator now (`set_view_heap_limit`) instead of when the title's
@@ -812,12 +829,14 @@ const UNCAPPED_VIEWS: u32 = 1 << 21;
 /// RDNA3, RX 7900 XT) took a page fault and removed the device on entering
 /// the world: a compute program read view slot 16,777,088 (0xffff80) of a
 /// heap of 1,507,328, past its end. Unclamped, that index is undefined on
-/// any host.
+/// any host. Probe 2^21 first, then the intermediate capacity needed by the
+/// title plus dynamic and null slots; use the portable 1,000,000 fallback
+/// if both host allocations fail.
 pub(crate) fn probe_view_limit() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let Some(host) = host() else { return };
-        let fits = |count: u32| {
+        let (views, failures) = select_view_heap_size(|count| {
             // SAFETY: plain heap creation; the heap is released at once.
             let made: windows::core::Result<ID3D12DescriptorHeap> = unsafe {
                 host.device
@@ -828,15 +847,14 @@ pub(crate) fn probe_view_limit() {
                         NodeMask: 0,
                     })
             };
-            made.is_ok()
-        };
-        let views = if fits(UNCAPPED_VIEWS) {
-            UNCAPPED_VIEWS
-        } else {
-            PORTABLE_VIEWS
-        };
+            made.map(drop)
+        });
+        for (size, error) in &failures {
+            tracing::warn!(views = *size, error = %error, "host view heap capacity probe failed");
+        }
         tracing::info!(
             views,
+            failed_probes = ?failures.iter().map(|(size, _)| *size).collect::<Vec<_>>(),
             "host view heaps hold {views} views; view indices are clamped to the null slot at the end from the first shader on"
         );
         victory_shader::emit::set_view_heap_limit(views - 1);
@@ -3111,6 +3129,40 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn view_heap_probe_uses_intermediate_capacity_then_portable_fallback() {
+        const TITLE_VIEWS: u32 = 1_245_184;
+        assert!(INTERMEDIATE_VIEWS >= TITLE_VIEWS + DYNAMIC + 1);
+
+        let mut tried = Vec::new();
+        let (selected, failures) = select_view_heap_size(|size| {
+            tried.push(size);
+            if size == INTERMEDIATE_VIEWS {
+                Ok(())
+            } else {
+                Err(size)
+            }
+        });
+        assert_eq!(selected, INTERMEDIATE_VIEWS);
+        assert_eq!(tried, [UNCAPPED_VIEWS, INTERMEDIATE_VIEWS]);
+        assert_eq!(failures, [(UNCAPPED_VIEWS, UNCAPPED_VIEWS)]);
+
+        let mut tried = Vec::new();
+        let (selected, failures) = select_view_heap_size(|size| {
+            tried.push(size);
+            Err(size)
+        });
+        assert_eq!(selected, PORTABLE_VIEWS);
+        assert_eq!(tried, [UNCAPPED_VIEWS, INTERMEDIATE_VIEWS]);
+        assert_eq!(
+            failures,
+            [
+                (UNCAPPED_VIEWS, UNCAPPED_VIEWS),
+                (INTERMEDIATE_VIEWS, INTERMEDIATE_VIEWS)
+            ]
+        );
+    }
 
     /// A null texture UAV keeps the title's dimension (3D for the world's
     /// wind field), and is 2D when the title names none.
