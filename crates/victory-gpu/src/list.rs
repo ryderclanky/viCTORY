@@ -865,7 +865,22 @@ extern "system" fn copy_buffer_region(
 /// other is not ([`crate::resource::target_format`]): their texels differ
 /// in size, so the host cannot copy between them (logged once).
 #[cfg(windows)]
-fn unlike(dst: This, src: This) -> bool {
+fn unlike(dst: This, src: This, mapped: bool) -> bool {
+    // A host copy without its largest levels has other subresources than
+    // the title texture (`VICTORY_TEXTURE_DROP_MIPS`). A caller that maps
+    // subresources (`mapped`) copies the levels the host has; any other
+    // copy with such a texture is skipped.
+    if !mapped && (crate::resource::dropped(src) > 0 || crate::resource::dropped(dst) > 0) {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!(
+                ?dst,
+                ?src,
+                "copy with a texture whose host copy leaves out levels skipped"
+            )
+        });
+        return true;
+    }
     let unlike = crate::resource::stands_in(dst) != crate::resource::stands_in(src);
     if unlike {
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -897,9 +912,10 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
         ) {
-            if unlike(dst, src) {
+            if unlike(dst, src, true) {
                 return;
             }
+            let levelwise = crate::resource::dropped(dst) != crate::resource::dropped(src);
             // Two title textures over the same memory have one host
             // texture between them: the copy would be of that texture onto
             // itself, which the host does not allow, and it would change
@@ -940,8 +956,12 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             ensure_state(list, src, COPY_SOURCE);
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
-            // SAFETY: an open list and live textures.
-            unsafe { list.list.CopyResource(to, from) };
+            if levelwise {
+                copy_levels(list, dst, to, src, from);
+            } else {
+                // SAFETY: an open list and live textures.
+                unsafe { list.list.CopyResource(to, from) };
+            }
         } else if let (Some((to, a)), Some((from, b))) = (
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
@@ -955,6 +975,56 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
 
 extern "system" fn copy_resource_x(this: This, dst: This, src: This, _flags: u32) {
     copy_resource(this, dst, src);
+}
+
+/// A whole-texture copy between host copies that leave out different
+/// numbers of levels (`VICTORY_TEXTURE_DROP_MIPS`): each title level both
+/// have, at its own index in each.
+#[cfg(windows)]
+fn copy_levels(
+    list: &crate::host::HostList,
+    dst: This,
+    to: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    src: This,
+    from: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+) {
+    use windows::core::Interface;
+    let location = |texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource, index: u32| {
+        // SAFETY: a plain footprint; only the subresource index is read when
+        // the kind is a subresource (0), which is how `copy_texture_region`
+        // names one.
+        let mut footprint: crate::resource::PlacedFootprint = unsafe { std::mem::zeroed() };
+        footprint.offset = u64::from(index);
+        CopyLocation {
+            resource: texture.as_raw().cast_const().cast(),
+            kind: 0,
+            footprint,
+        }
+    };
+    let count =
+        crate::resource::title_subresources(dst).min(crate::resource::title_subresources(src));
+    for index in 0..count {
+        let (Some(d), Some(s)) = (
+            crate::resource::host_subresource(dst, index),
+            crate::resource::host_subresource(src, index),
+        ) else {
+            continue;
+        };
+        let (to_at, from_at) = (location(to, d), location(from, s));
+        // SAFETY: an open list and live textures; both subresources exist
+        // and have the title level's size. The locations have the host's layout
+        // (asserted in `copy_texture_region`).
+        unsafe {
+            list.list.CopyTextureRegion(
+                (&raw const to_at).cast(),
+                0,
+                0,
+                0,
+                (&raw const from_at).cast(),
+                None,
+            )
+        };
+    }
 }
 
 /// A copy location as titles pass it, laid out as the host's: a resource,
@@ -1033,8 +1103,15 @@ extern "system" fn copy_texture_region(
             }
             return;
         };
-        if unlike(dst.resource, src.resource) {
+        if unlike(dst.resource, src.resource, true) {
             return;
+        }
+        let mut dst = dst;
+        if dst.kind != FOOTPRINT && crate::resource::dropped(dst.resource) > 0 {
+            match crate::resource::host_subresource(dst.resource, dst.footprint.offset as u32) {
+                Some(index) => dst.footprint.offset = u64::from(index),
+                None => return,
+            }
         }
         let mut from = src;
         // Both sides are the same subresource of one host texture (set below).
@@ -1067,6 +1144,12 @@ extern "system" fn copy_texture_region(
             let Some(texture) = crate::resource::host_resource(src.resource) else {
                 return;
             };
+            if crate::resource::dropped(src.resource) > 0 {
+                match crate::resource::host_subresource(src.resource, src.footprint.offset as u32) {
+                    Some(index) => from.footprint.offset = u64::from(index),
+                    None => return,
+                }
+            }
             // The same subresource of one host texture on both sides (two
             // title textures over one memory): not a copy the host allows.
             // The states and the copy are left out below; the rest is
@@ -1074,7 +1157,7 @@ extern "system" fn copy_texture_region(
             same = texture.as_raw() == to.as_raw()
                 && src.kind != FOOTPRINT
                 && dst.kind != FOOTPRINT
-                && src.footprint.offset as u32 == dst.footprint.offset as u32;
+                && from.footprint.offset as u32 == dst.footprint.offset as u32;
             list.twin_use(src.resource, false, false);
             if crate::texture::title_written(texture) {
                 crate::texture::upload(list, src.resource, texture);
@@ -1176,6 +1259,13 @@ fn read_back(
     let data = buffer_range(dst.resource, dst.footprint.offset, bytes)
         .ok_or("a destination outside its buffer")?;
     let texture = crate::resource::host_resource(src.resource).ok_or("no host texture")?;
+    let mut src = src;
+    if crate::resource::dropped(src.resource) > 0 {
+        match crate::resource::host_subresource(src.resource, src.footprint.offset as u32) {
+            Some(index) => src.footprint.offset = u64::from(index),
+            None => return Err("a mip level omitted from the host texture"),
+        }
+    }
     let buffer = host.read_back_buffer(size).ok_or("no read-back buffer")?;
     // As a texture source of any copy: what shaders wrote to a depth twin
     // and what the title wrote itself first, then the state.
@@ -1251,7 +1341,7 @@ extern "system" fn resolve(
         use windows::core::Interface;
         const RESOLVE_DEST: u32 = 0x1000;
         const RESOLVE_SOURCE: u32 = 0x2000;
-        if unlike(dst, src) {
+        if unlike(dst, src, false) {
             return;
         }
         // Depth textures shaders also write: what they wrote, first.
@@ -1959,22 +2049,30 @@ impl ValueWait {
     }
 
     fn holds(&self) -> bool {
-        let bytes = if self.wide { 8 } else { 4 };
-        if self.address == 0 {
-            return true;
-        }
-        static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *ASK.get_or_init(|| std::env::var_os("VICTORY_WAIT_ASK").is_some_and(|v| v == "1"))
-            && !crate::texture::committed(self.address as *const u8, bytes)
+        #[cfg(not(windows))]
         {
+            let _ = self;
             return true;
         }
-        // The low `bytes` bytes; the rest stays zero.
-        let mut raw = [0u8; 8];
-        if !crate::host::read_into(self.address as *const u8, &mut raw[..bytes]) {
-            return true;
+        #[cfg(windows)]
+        {
+            let bytes = if self.wide { 8 } else { 4 };
+            if self.address == 0 {
+                return true;
+            }
+            static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *ASK.get_or_init(|| std::env::var_os("VICTORY_WAIT_ASK").is_some_and(|v| v == "1"))
+                && !crate::texture::committed(self.address as *const u8, bytes)
+            {
+                return true;
+            }
+            // The low `bytes` bytes; the rest stays zero.
+            let mut raw = [0u8; 8];
+            if !crate::host::read_into(self.address as *const u8, &mut raw[..bytes]) {
+                return true;
+            }
+            self.holds_for(u64::from_le_bytes(raw))
         }
-        self.holds_for(u64::from_le_bytes(raw))
     }
 
     /// Where the value waited for is: address and bytes.

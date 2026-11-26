@@ -105,8 +105,10 @@ enum Command {
         #[arg(long)]
         execute: bool,
         /// The console model the title sees (device type, memory).
-        #[arg(long, value_enum, default_value_t = Console::SeriesX)]
-        console: Console,
+        /// Unset, `VICTORY_CONSOLE=series-s` selects the smaller console
+        /// (the 16 GB laptop preset); otherwise the title sees a Series X.
+        #[arg(long, value_enum)]
+        console: Option<Console>,
         /// Arguments for the title, after `--` (it reads the whole command
         /// line; a title that relaunches itself passes some).
         #[arg(last = true)]
@@ -187,7 +189,16 @@ fn main() -> Result<()> {
             execute,
             console,
             title_args: _,
-        } => run::run(&exe, unimplemented, strict, execute, console),
+        } => {
+            let console = match victory_hle::console::resolve(
+                console.map(|c| matches!(c, Console::SeriesS)),
+                std::env::var("VICTORY_CONSOLE").ok().as_deref(),
+            ) {
+                victory_hle::console::Console::SeriesS => Console::SeriesS,
+                victory_hle::console::Console::SeriesX => Console::SeriesX,
+            };
+            run::run(&exe, unimplemented, strict, execute, console)
+        }
         Command::Config => show_config(),
     }
 }

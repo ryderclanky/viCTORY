@@ -165,7 +165,7 @@ fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
 fn without_structures(shaders: &[Arc<Shader>]) -> bool {
     static OUT: OnceLock<bool> = OnceLock::new();
     let out = *OUT.get_or_init(|| {
-        let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
+        let builder = crate::laptop::opt_in(std::env::var("VICTORY_BVH_BUILDER").ok().as_deref());
         let forced = std::env::var_os("VICTORY_RT_RESOLVE").is_some_and(|v| v == "1");
         !forced && !builder
     });

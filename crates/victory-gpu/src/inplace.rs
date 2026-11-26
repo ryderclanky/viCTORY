@@ -93,10 +93,7 @@ pub(crate) fn probe_level() -> u8 {
 pub(crate) fn level() -> u8 {
     static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *LEVEL.get_or_init(|| {
-        std::env::var("VICTORY_INPLACE")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(0)
+        crate::laptop::inplace_level(std::env::var("VICTORY_INPLACE").ok().as_deref())
     })
 }
 

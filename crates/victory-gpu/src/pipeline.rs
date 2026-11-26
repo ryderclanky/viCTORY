@@ -414,7 +414,9 @@ pub(crate) fn builder_off(why: &'static str) {
 #[cfg(windows)]
 pub(crate) fn builder_runs() -> bool {
     static ALLOWED: OnceLock<bool> = OnceLock::new();
-    if !*ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")) {
+    if !*ALLOWED
+        .get_or_init(|| crate::laptop::opt_in(std::env::var("VICTORY_BVH_BUILDER").ok().as_deref()))
+    {
         return false;
     }
     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());

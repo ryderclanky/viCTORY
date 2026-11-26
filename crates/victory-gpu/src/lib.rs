@@ -44,11 +44,15 @@ mod heap_pass;
 #[cfg(windows)]
 mod heap_worker;
 #[cfg(windows)]
+mod heaps;
+#[cfg(windows)]
 mod host;
 #[cfg(windows)]
 mod indirect;
 #[cfg(windows)]
 mod inplace;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod laptop;
 pub mod list;
 #[cfg(windows)]
 mod memory;

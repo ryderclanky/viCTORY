@@ -14,8 +14,9 @@
 //! at -5.5 EV and in one at -9.75), and the title's own lighting then applies it to the
 //! surfaces' colours. Raised, not added: the result is the next frame's history.
 //!
-//! `VICTORY_AMBIENT=<level>` opts in (0.6 is the fallback for an invalid value; `off` keeps
-//! what the title wrote, `0` is no indirect light at all). `VICTORY_AMBIENT_TINT=r,g,b` and
+//! `VICTORY_AMBIENT=<level>` opts in. The level is clamped to `0.0..=1.0`.
+//! Unset, `off`, or not a number keeps what the title wrote. `0` is no
+//! indirect light at all. `VICTORY_AMBIENT_TINT=r,g,b` and
 //! `VICTORY_AMBIENT_SHADE=strength,radius,near,tan` tune the colour and the
 //! depth-only occlusion; with the `diagnostics` feature `VICTORY_AMBIENT_FILE` re-reads
 //! both from a file twice a second.
@@ -42,27 +43,14 @@ pub(crate) const LIGHT: (u8, u32) = (1, 176);
 /// and place in its table.
 pub(crate) const DEPTH: (u8, u32) = (0, 464);
 
-/// The floor's fallback level: 0.6 looked balanced in the source fork's run a2. The pass is
-/// disabled unless `VICTORY_AMBIENT` explicitly opts in because this PC has not reached gameplay.
-const DEFAULT: f32 = 0.6;
-
-/// The floor; `None` if off.
+/// The floor; `None` if off. Unset stays off. A set level is clamped to
+/// `0.0..=1.0` (`crate::laptop::ambient_level`).
 pub(crate) fn level() -> Option<f32> {
-    static LEVEL: OnceLock<f32> = OnceLock::new();
-    let level = *LEVEL.get_or_init(|| {
-        let Ok(set) = std::env::var("VICTORY_AMBIENT") else {
-            return -1.0;
-        };
-        if set.trim() == "off" {
-            return -1.0;
-        }
-        set.trim()
-            .parse()
-            .ok()
-            .filter(|l: &f32| l.is_finite() && *l >= 0.0)
-            .unwrap_or(DEFAULT)
+    static LEVEL: OnceLock<Option<f32>> = OnceLock::new();
+    let set = *LEVEL.get_or_init(|| {
+        crate::laptop::ambient_level(std::env::var("VICTORY_AMBIENT").ok().as_deref())
     });
-    (level >= 0.0).then_some(level)
+    live_level().or(set)
 }
 
 /// The light's colour: warm white, or what `VICTORY_AMBIENT_TINT=r,g,b` gives. With

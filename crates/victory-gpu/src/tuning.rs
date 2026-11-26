@@ -37,6 +37,11 @@ pub(crate) struct Profile {
     pub(crate) levels_on_demand: bool,
     /// The most staging buffers kept spare, in MiB (`VICTORY_STAGING_POOL_MB`).
     pub(crate) staging_mb: u64,
+    /// Whether textures the title fills are placed in shared heaps
+    /// (`VICTORY_TEXTURE_HEAPS`) instead of one committed resource each.
+    /// On for a small machine: each committed texture adds driver private
+    /// bytes, which is what pushed a 16 GB laptop to 18-20 GiB.
+    pub(crate) texture_heaps: bool,
 }
 
 /// The defaults this fork shipped with, for a machine nothing is known about: the reference
@@ -48,6 +53,7 @@ const LARGE: Profile = Profile {
     room_percent: 90,
     levels_on_demand: false,
     staging_mb: 256,
+    texture_heaps: false,
 };
 
 /// The profile a machine with `ram_gb` of memory and a card budget of `budget_mb` gets.
@@ -86,6 +92,7 @@ pub(crate) fn choose(ram_gb: u64, budget_mb: u64) -> Profile {
         room_percent: 92,
         levels_on_demand: true,
         staging_mb: if ram_gb != 0 && ram_gb <= 20 { 64 } else { 256 },
+        texture_heaps: true,
     }
 }
 
@@ -167,6 +174,7 @@ pub(crate) fn profile() -> &'static Profile {
             room_percent = read.room_percent,
             levels_on_demand = read.levels_on_demand,
             staging_mb = read.staging_mb,
+            texture_heaps = read.texture_heaps,
             "the memory this machine has, and the defaults it sets (VICTORY_PROFILE=0: the shipped ones)"
         );
         read
@@ -195,6 +203,10 @@ mod tests {
             "levels on demand stays off, as measured"
         );
         assert_eq!(p.staging_mb, 256);
+        assert!(
+            !p.texture_heaps,
+            "a large card keeps one committed texture each"
+        );
     }
 
     #[test]
@@ -205,6 +217,7 @@ mod tests {
         assert_eq!(p.room_percent, 92);
         assert!(p.levels_on_demand);
         assert_eq!(p.staging_mb, 64);
+        assert!(p.texture_heaps, "a 16 GB machine shares texture heaps");
         // a 4 GB card keeps its floor, never nothing
         assert_eq!(choose(16, 3_800).targets_room_mb, 950);
         assert_eq!(choose(16, 1_000).targets_room_mb, 512);

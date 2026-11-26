@@ -1597,6 +1597,7 @@ extern "system" fn copy_page_mappings(
     });
     let mut ok = true;
     // The remapping meter: what the title asks for, by kind of range.
+    #[cfg(windows)]
     crate::framelog::add(crate::framelog::T::PageMapCalls, 1);
     for b in batches.into_iter().flatten() {
         if b.ranges.is_null() {
@@ -1609,6 +1610,7 @@ extern "system" fn copy_page_mappings(
             let len = u64::from(r.count) * PAGE;
             let inside = |pages: u32| r.start.checked_add(pages).is_some_and(|e| e <= pool_pages);
             let source = pool + u64::from(r.start) * PAGE;
+            #[cfg(windows)]
             {
                 use crate::framelog::{T, add};
                 let counted = match r.kind {
