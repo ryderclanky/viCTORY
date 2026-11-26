@@ -81,6 +81,14 @@ set VICTORY_CARD_FETCH_INFLIGHT=0
 victory run <game dir>\<the title's exe> --execute
 ```
 
+`play.ps1` sets that list and pins `VICTORY_CACHE_DIR` to
+`%LOCALAPPDATA%\victory\cache` (and the data directory beside it), outside the
+repository and the same path every boot. It does not delete the cache. Shader
+translations and the host pipeline library live under that directory, so the
+next boot loads them instead of compiling again. Do not set
+`VICTORY_SHADER_CACHE_KEY=exe`: that hashes the whole executable, and every
+rebuild misses.
+
 `VICTORY_CONSOLE` applies only when `--console` is not passed. `--console series-x`
 still forces the larger console.
 

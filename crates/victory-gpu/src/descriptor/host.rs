@@ -1174,6 +1174,23 @@ fn select_view_heap_size<E>(mut probe: impl FnMut(u32) -> Result<(), E>) -> (u32
     (PORTABLE_VIEWS, failures)
 }
 
+/// Whether this machine keeps the portable view-heap cap instead of probing
+/// larger ones. The chosen size is part of the shader cache key; a probe
+/// that flips with free memory recompiles every shader. A small profile
+/// (and a machine whose profile turns levels on demand on) uses the cap the
+/// 8 GB laptop's driver accepts.
+fn portable_view_heap() -> bool {
+    match std::env::var("VICTORY_PROFILE")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+    {
+        Some("0") | Some("large") => false,
+        Some("small") => true,
+        _ => crate::tuning::profile().levels_on_demand,
+    }
+}
+
 /// Picks, once, the null slot at the end of every host view heap and tells
 /// the translator now (`set_view_heap_limit`) instead of when the title's
 /// heap is made: a shader keeps the limit it was translated with, and the
@@ -1188,11 +1205,21 @@ fn select_view_heap_size<E>(mut probe: impl FnMut(u32) -> Result<(), E>) -> (u32
 /// heap of 1,507,328, past its end. Unclamped, that index is undefined on
 /// any host. Probe 2^21 first, then the intermediate capacity needed by the
 /// title plus dynamic and null slots; use the portable 1,000,000 fallback
-/// if both host allocations fail.
+/// if both host allocations fail. A small machine skips that probe
+/// ([`portable_view_heap`]).
 pub(crate) fn probe_view_limit() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let Some(host) = host() else { return };
+        if portable_view_heap() {
+            let views = PORTABLE_VIEWS;
+            tracing::info!(
+                views,
+                "host view heaps hold {views} views; the portable cap is used so the shader cache key does not follow a probe that depends on free memory"
+            );
+            victory_shader::emit::set_view_heap_limit(views - 1);
+            return;
+        }
         let (views, failures) = select_view_heap_size(|count| {
             // SAFETY: plain heap creation; the heap is released at once.
             let made: windows::core::Result<ID3D12DescriptorHeap> = unsafe {
