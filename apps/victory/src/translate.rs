@@ -169,11 +169,17 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<()>
                 }
             }
         }
-        anyhow::ensure!(!wanted.is_empty(), "no 16-digit shader hash in {}", file.display());
+        anyhow::ensure!(
+            !wanted.is_empty(),
+            "no 16-digit shader hash in {}",
+            file.display()
+        );
     }
     // `VICTORY_WARM_SECONDS=<n>`: stop taking new shaders after n seconds
     // (what is done stays in the cache; the next warm-up goes on from there).
-    let limit = std::env::var("VICTORY_WARM_SECONDS").ok().and_then(|v| v.trim().parse::<u64>().ok());
+    let limit = std::env::var("VICTORY_WARM_SECONDS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok());
     let cfg = victory_core::Config::load()?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let paths = crate::default_paths(paths)?;
@@ -182,7 +188,10 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<()>
     let done = Mutex::new(HashSet::new());
     let counts = [const { AtomicUsize::new(0) }; 5];
     for root in &paths {
-        for entry in walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok) {
+        for entry in walkdir::WalkDir::new(root)
+            .into_iter()
+            .filter_map(Result::ok)
+        {
             if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
                 continue;
             }
@@ -208,7 +217,10 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<()>
                             }
                             let n = counts[4].fetch_add(1, Ordering::Relaxed) + 1;
                             if n.is_multiple_of(1000) {
-                                println!("warm-up      {n} shaders so far, {:.0} s", began.elapsed().as_secs_f64());
+                                println!(
+                                    "warm-up      {n} shaders so far, {:.0} s",
+                                    began.elapsed().as_secs_f64()
+                                );
                             }
                             let which = match victory_hle::modules::d3d12x::warm_shader(&bytes) {
                                 Ok(true) => 0,
@@ -223,8 +235,16 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<()>
         }
     }
     let [translated, there, failed] = [0, 1, 2].map(|i| counts[i].load(Ordering::Relaxed));
-    let asked = if all { "all".to_owned() } else { wanted.len().to_string() };
-    let stopped = if counts[3].load(Ordering::Relaxed) > 0 { " (stopped at the time limit)" } else { "" };
+    let asked = if all {
+        "all".to_owned()
+    } else {
+        wanted.len().to_string()
+    };
+    let stopped = if counts[3].load(Ordering::Relaxed) > 0 {
+        " (stopped at the time limit)"
+    } else {
+        ""
+    };
     println!(
         "warm-up      {asked} hashes asked, {} found: {translated} translated now, {there} in the cache already, {failed} do not translate; {:.1} s on {threads} threads{stopped}",
         translated + there + failed,
@@ -243,7 +263,10 @@ pub fn run(
     let paths = crate::default_paths(paths)?;
     // `VICTORY_HOST_MAX_WAVE=32`: translate as for a host whose waves have
     // at most 32 lanes (as the runtime does on such a card).
-    if let Some(n) = std::env::var("VICTORY_HOST_MAX_WAVE").ok().and_then(|v| v.parse().ok()) {
+    if let Some(n) = std::env::var("VICTORY_HOST_MAX_WAVE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
         victory_shader::emit::set_host_max_wave(n);
     }
     let dll = validate.then(Validator::default_path).flatten();
@@ -434,7 +457,10 @@ fn translate(
         && let Some((dir, texts)) = spec.split_once(';')
     {
         let line = example();
-        if texts.split('|').any(|text| !text.is_empty() && line.contains(text)) {
+        if texts
+            .split('|')
+            .any(|text| !text.is_empty() && line.contains(text))
+        {
             let name: String = source
                 .label()
                 .chars()
@@ -443,7 +469,10 @@ fn translate(
                 .take(70)
                 .collect();
             let _ = std::fs::create_dir_all(dir);
-            let _ = std::fs::write(std::path::Path::new(dir).join(format!("{name}.{hash}.cdxil")), &bytes[..]);
+            let _ = std::fs::write(
+                std::path::Path::new(dir).join(format!("{name}.{hash}.cdxil")),
+                &bytes[..],
+            );
         }
     }
     if !lock(seen).insert(code) {
@@ -457,24 +486,72 @@ fn translate(
         Ok(p) => p,
         Err(e) => return t.fail(e.to_string(), example),
     };
+    // `VICTORY_NATIVE_HEADS=<file>`: each native program's first 36 bytes
+    // (the console compiler's `v_nop` header carries its hash) with the
+    // container's line, appended: to match the raw code device methods 0x1c8
+    // / 0x218 are handed against the containers.
+    if let Some(path) = std::env::var_os("VICTORY_NATIVE_HEADS") {
+        use std::io::Write as _;
+        let mut text = String::new();
+        for n in &programs {
+            let head: String = n
+                .code
+                .iter()
+                .take(160)
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            text.push_str(&format!(
+                "{head}	{}	{}
+",
+                n.code.len(),
+                example()
+            ));
+        }
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = f.write_all(text.as_bytes());
+        }
+        // `VICTORY_HEADS_ONLY=1`: the list alone, nothing translated.
+        if std::env::var_os("VICTORY_HEADS_ONLY").is_some() {
+            return;
+        }
+    }
     // `VICTORY_FAIL_DUMP=<dir>`: the first 3 containers of each failure reason, as the title
     // has them (`.cdxil`), to work on a translator gap offline
     let dump = std::env::var_os("VICTORY_FAIL_DUMP");
-    let before: Option<BTreeMap<String, usize>> = dump.as_ref().map(|_| t.failed.iter().map(|(k, v)| (k.clone(), v.0)).collect());
+    let before: Option<BTreeMap<String, usize>> = dump
+        .as_ref()
+        .map(|_| t.failed.iter().map(|(k, v)| (k.clone(), v.0)).collect());
     translate_programs(&container, programs, &example, t, checks);
     if let (Some(dir), Some(before)) = (dump, before) {
         for (reason, (n, _)) in &t.failed {
             let was = before.get(reason).copied().unwrap_or(0);
             if *n > was && was < 3 {
-                let stem: String = reason.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).take(60).collect();
+                let stem: String = reason
+                    .chars()
+                    .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                    .take(60)
+                    .collect();
                 let _ = std::fs::create_dir_all(&dir);
-                let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{stem}_{was}.cdxil")), &bytes[..]);
+                let _ = std::fs::write(
+                    std::path::Path::new(&dir).join(format!("{stem}_{was}.cdxil")),
+                    &bytes[..],
+                );
             }
         }
     }
 }
 
-fn translate_programs(container: &Container, programs: Vec<NativeProgram>, example: &dyn Fn() -> String, t: &mut Tally, checks: &mut Checks) {
+fn translate_programs(
+    container: &Container,
+    programs: Vec<NativeProgram>,
+    example: &dyn Fn() -> String,
+    t: &mut Tally,
+    checks: &mut Checks,
+) {
     for p in programs {
         t.programs += 1;
         match victory_shader::spill::build(&p) {
@@ -573,7 +650,11 @@ fn census_line(label: &str, native: &NativeProgram, p: &ir::Program, shader: &em
     static OUT: std::sync::OnceLock<Option<Mutex<std::fs::File>>> = std::sync::OnceLock::new();
     let Some(out) = OUT.get_or_init(|| {
         let path = std::env::var_os("VICTORY_SHADER_CENSUS")?;
-        let file = std::fs::OpenOptions::new().create(true).append(true).open(path).ok()?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok()?;
         Some(Mutex::new(file))
     }) else {
         return;
@@ -598,7 +679,12 @@ fn census_line(label: &str, native: &NativeProgram, p: &ir::Program, shader: &em
         console[k] += 1;
     }
     let mut line = format!("{label}\twave64={}", u8::from(native.wave64));
-    for (name, n) in ["c_total", "c_valu", "c_sop", "c_smem", "c_buffer", "c_image", "c_ds", "c_sopp", "c_other"].iter().zip(console) {
+    for (name, n) in [
+        "c_total", "c_valu", "c_sop", "c_smem", "c_buffer", "c_image", "c_ds", "c_sopp", "c_other",
+    ]
+    .iter()
+    .zip(console)
+    {
         line.push_str(&format!("\t{name}={n}"));
     }
     for (name, n) in emit::census::KINDS.iter().zip(census.counts) {

@@ -94,9 +94,11 @@ impl Host {
                 if let Some(made) = &device {
                     let factory: IDXGIFactory4 =
                         CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
-                    if let Ok(adapter) = factory.EnumAdapterByLuid::<IDXGIAdapter1>(made.GetAdapterLuid())
+                    if let Ok(adapter) =
+                        factory.EnumAdapterByLuid::<IDXGIAdapter1>(made.GetAdapterLuid())
                         && let Ok(desc) = adapter.GetDesc1()
-                        && (desc.Flags & 2 != 0 || (desc.VendorId == 0x1414 && desc.DeviceId == 0x8c))
+                        && (desc.Flags & 2 != 0
+                            || (desc.VendorId == 0x1414 && desc.DeviceId == 0x8c))
                     {
                         return Err("the default device is the software adapter".to_owned());
                     }
@@ -280,7 +282,10 @@ impl Host {
                 let message = buffer.as_mut_ptr().cast::<D3D12_MESSAGE>();
                 if queue.GetMessage(i, Some(message), &mut len).is_ok() {
                     let m = &*message;
-                    let bytes = std::slice::from_raw_parts(m.pDescription, m.DescriptionByteLength.saturating_sub(1));
+                    let bytes = std::slice::from_raw_parts(
+                        m.pDescription,
+                        m.DescriptionByteLength.saturating_sub(1),
+                    );
                     text.push_str(" | ");
                     text.push_str(&String::from_utf8_lossy(bytes));
                 }
@@ -353,9 +358,11 @@ impl Host {
                 pShaderBytecode: ps.as_ptr().cast(),
                 BytecodeLength: ps.len(),
             },
-            GS: gs.map_or(D3D12_SHADER_BYTECODE::default(), |gs| D3D12_SHADER_BYTECODE {
-                pShaderBytecode: gs.as_ptr().cast(),
-                BytecodeLength: gs.len(),
+            GS: gs.map_or(D3D12_SHADER_BYTECODE::default(), |gs| {
+                D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: gs.as_ptr().cast(),
+                    BytecodeLength: gs.len(),
+                }
             }),
             SampleMask: u32::MAX,
             RasterizerState: D3D12_RASTERIZER_DESC {
@@ -600,6 +607,7 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         root_srvs: Vec::new(),
         root_uavs: Vec::new(),
         root_indexed_views: Vec::new(),
+        half_views: Vec::new(),
     }
 }
 
@@ -979,6 +987,7 @@ fn transition(
 
 /// A view in the heap for [`Host::dispatch`].
 #[cfg(test)]
+#[derive(Clone, Copy)]
 pub enum View<'a> {
     /// An RGBA32F texture SRV (width, height, texels).
     Texture(u32, u32, &'a [[f32; 4]]),
@@ -992,6 +1001,9 @@ pub enum View<'a> {
     UintTextureUav(u32, u32),
     /// A typed RGBA16F buffer UAV of this many elements, zeroed.
     HalfUav(u32),
+    /// The same buffer viewed as R16G16B16A16_UINT: what a translated
+    /// program that moves halves is shown ([`super::HostShader::half_views`]).
+    HalfUintUav(u32),
     /// A constant buffer of these dwords.
     Cbv(&'a [u32]),
     /// A buffer SRV over these dwords.
@@ -1224,12 +1236,18 @@ impl Host {
                         );
                         keep.push(tex);
                     }
-                    View::RawUav(_) | View::HalfUav(_) => {
+                    View::RawUav(_) | View::HalfUav(_) | View::HalfUintUav(_) => {
                         // (dwords, format, elements, flags)
                         let (n, format, elements, flags) = match *v {
                             View::HalfUav(e) => (
                                 2 * e,
                                 DXGI_FORMAT_R16G16B16A16_FLOAT,
+                                e,
+                                D3D12_BUFFER_UAV_FLAG_NONE,
+                            ),
+                            View::HalfUintUav(e) => (
+                                2 * e,
+                                DXGI_FORMAT_R16G16B16A16_UINT,
                                 e,
                                 D3D12_BUFFER_UAV_FLAG_NONE,
                             ),

@@ -20,7 +20,8 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 
 use windows_sys::Win32::System::EventLog::{
-    EVT_HANDLE, EVT_SUBSCRIBE_NOTIFY_ACTION, EvtSubscribe, EvtSubscribeActionDeliver, EvtSubscribeToFutureEvents,
+    EVT_HANDLE, EVT_SUBSCRIBE_NOTIFY_ACTION, EvtSubscribe, EvtSubscribeActionDeliver,
+    EvtSubscribeToFutureEvents,
 };
 
 /// Entries of a display driver seen since the start.
@@ -54,12 +55,21 @@ fn seen() {
     );
 }
 
-unsafe extern "system" fn on_event(action: EVT_SUBSCRIBE_NOTIFY_ACTION, _context: *const core::ffi::c_void, _event: EVT_HANDLE) -> u32 {
+unsafe extern "system" fn on_event(
+    action: EVT_SUBSCRIBE_NOTIFY_ACTION,
+    _context: *const core::ffi::c_void,
+    _event: EVT_HANDLE,
+) -> u32 {
     if action == EvtSubscribeActionDeliver {
         seen();
     }
     0
 }
+
+/// The entries [`start`] subscribes to: the display drivers' and the
+/// `Display` source's, at levels 1-3 (critical, error, warning).
+const QUERY: &str = "*[System[Provider[@Name='nvlddmkm' or @Name='amdkmdag' or @Name='amdwddmg' or @Name='igfx' \
+                     or @Name='igfxn' or @Name='Display'] and (Level=1 or Level=2 or Level=3)]]";
 
 /// Subscribes to the display drivers' entries in the system's event log,
 /// once. Entries from before the call are not delivered.
@@ -72,11 +82,14 @@ pub(crate) fn start() {
         let wide = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
         let channel = wide("System");
         // The kernel drivers of the three vendors, and the system's own
-        // "display driver stopped responding" source.
-        let query = wide(
-            "*[System[Provider[@Name='nvlddmkm' or @Name='amdkmdag' or @Name='amdwddmg' or @Name='igfx' or @Name='igfxn' \
-             or @Name='Display']]]",
-        );
+        // "display driver stopped responding" source (4101, a warning).
+        // Critical, error and warning entries only: the `Display` source
+        // also writes information entries that are no fault, among them
+        // 4125, the Auto HDR notice ("Good news-… has been enhanced"),
+        // which Windows 11 writes when a game's window first shows. On a
+        // machine with Auto HDR on it tripped the switch a second into
+        // every run, and the draw windows were off from the start.
+        let query = wide(QUERY);
         // SAFETY: valid strings for the call's length; the callback is a
         // plain function that touches only statics; the subscription is
         // kept for the life of the process.
@@ -130,30 +143,60 @@ mod tests {
     #[ignore = "writes one entry to the Application event log: run it by name with --ignored"]
     fn an_entry_written_reaches_a_subscription() {
         use windows_sys::Win32::System::EventLog::{
-            DeregisterEventSource, EVENTLOG_INFORMATION_TYPE, EvtClose, RegisterEventSourceW, ReportEventW,
+            DeregisterEventSource, EVENTLOG_INFORMATION_TYPE, EvtClose, RegisterEventSourceW,
+            ReportEventW,
         };
         static GOT: AtomicU64 = AtomicU64::new(0);
-        unsafe extern "system" fn got(action: EVT_SUBSCRIBE_NOTIFY_ACTION, _: *const core::ffi::c_void, _: EVT_HANDLE) -> u32 {
+        unsafe extern "system" fn got(
+            action: EVT_SUBSCRIBE_NOTIFY_ACTION,
+            _: *const core::ffi::c_void,
+            _: EVT_HANDLE,
+        ) -> u32 {
             if action == EvtSubscribeActionDeliver {
                 GOT.fetch_add(1, Relaxed);
             }
             0
         }
         let wide = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
-        let (channel, query) = (wide("Application"), wide("*[System[Provider[@Name='victory-drvwatch-test']]]"));
+        let (channel, query) = (
+            wide("Application"),
+            wide("*[System[Provider[@Name='victory-drvwatch-test']]]"),
+        );
         // SAFETY: as in `start`.
         let subscription = unsafe {
-            EvtSubscribe(0, std::ptr::null_mut(), channel.as_ptr(), query.as_ptr(), 0, std::ptr::null(), Some(got), EvtSubscribeToFutureEvents)
+            EvtSubscribe(
+                0,
+                std::ptr::null_mut(),
+                channel.as_ptr(),
+                query.as_ptr(),
+                0,
+                std::ptr::null(),
+                Some(got),
+                EvtSubscribeToFutureEvents,
+            )
         };
         assert_ne!(subscription, 0, "{}", std::io::Error::last_os_error());
-        let (name, text) = (wide("victory-drvwatch-test"), wide("a test entry of the VIctory layer's driver watch"));
+        let (name, text) = (
+            wide("victory-drvwatch-test"),
+            wide("a test entry of the VIctory layer's driver watch"),
+        );
         // SAFETY: a source of our own name, one string, no data.
         unsafe {
             let source = RegisterEventSourceW(std::ptr::null(), name.as_ptr());
             assert!(!source.is_null(), "{}", std::io::Error::last_os_error());
             let strings = [text.as_ptr()];
             assert_ne!(
-                ReportEventW(source, EVENTLOG_INFORMATION_TYPE, 0, 1, std::ptr::null_mut(), 1, 0, strings.as_ptr(), std::ptr::null()),
+                ReportEventW(
+                    source,
+                    EVENTLOG_INFORMATION_TYPE,
+                    0,
+                    1,
+                    std::ptr::null_mut(),
+                    1,
+                    0,
+                    strings.as_ptr(),
+                    std::ptr::null()
+                ),
                 0,
                 "{}",
                 std::io::Error::last_os_error()
@@ -176,10 +219,19 @@ mod tests {
     #[test]
     fn the_system_takes_the_subscription() {
         let wide = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
-        let (channel, query) = (wide("System"), wide("*[System[Provider[@Name='nvlddmkm' or @Name='Display']]]"));
+        let (channel, query) = (wide("System"), wide(QUERY));
         // SAFETY: as in `start`.
         let subscription = unsafe {
-            EvtSubscribe(0, std::ptr::null_mut(), channel.as_ptr(), query.as_ptr(), 0, std::ptr::null(), Some(on_event), EvtSubscribeToFutureEvents)
+            EvtSubscribe(
+                0,
+                std::ptr::null_mut(),
+                channel.as_ptr(),
+                query.as_ptr(),
+                0,
+                std::ptr::null(),
+                Some(on_event),
+                EvtSubscribeToFutureEvents,
+            )
         };
         assert_ne!(subscription, 0, "{}", std::io::Error::last_os_error());
         // SAFETY: our own subscription.

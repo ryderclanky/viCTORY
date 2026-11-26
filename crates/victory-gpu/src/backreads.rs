@@ -68,11 +68,16 @@ const WHO: usize = 7;
 /// 0 off, 1 counted only, 2 with looks, 3 in turn.
 fn setting() -> u8 {
     static MODE: OnceLock<u8> = OnceLock::new();
-    *MODE.get_or_init(|| match std::env::var("VICTORY_BACK_READS").as_deref().map(str::trim) {
-        Ok("1") => 1,
-        Ok("2") => 2,
-        Ok("alt") => 3,
-        _ => 0,
+    *MODE.get_or_init(|| {
+        match std::env::var("VICTORY_BACK_READS")
+            .as_deref()
+            .map(str::trim)
+        {
+            Ok("1") => 1,
+            Ok("2") => 2,
+            Ok("alt") => 3,
+            _ => 0,
+        }
     })
 }
 
@@ -87,7 +92,13 @@ fn looking() -> bool {
         2 => true,
         3 => {
             static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
-            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            let on = (EPOCH
+                .get_or_init(std::time::Instant::now)
+                .elapsed()
+                .as_secs()
+                / 20)
+                % 2
+                == 1;
             static LAST: AtomicU8 = AtomicU8::new(2);
             if LAST.swap(u8::from(on), Relaxed) != u8::from(on) {
                 tracing::info!(
@@ -257,7 +268,9 @@ fn each(s: &mut State, copy: (u64, u64), f: impl Fn(&mut Tally)) {
 /// page's title addresses, and how many there are; `None` if Windows did
 /// not answer.
 fn valid(seen: &Seen) -> Option<(u32, u32)> {
-    use windows_sys::Win32::System::ProcessStatus::{K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION};
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION,
+    };
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let pages = ((seen.to - seen.from) / KERNEL_PAGE).min(16);
     let mut touched = [false; 16];
@@ -287,7 +300,10 @@ fn valid(seen: &Seen) -> Option<(u32, u32)> {
             }
         }
     }
-    Some((touched[..pages].iter().filter(|&&t| t).count() as u32, pages as u32))
+    Some((
+        touched[..pages].iter().filter(|&&t| t).count() as u32,
+        pages as u32,
+    ))
 }
 
 /// Takes the stretch's 4 KiB pages out of the working set at every title
@@ -325,7 +341,11 @@ fn judge(seen: &Seen) -> Judged {
     } else {
         None
     };
-    Judged { written, looked, busy: seen.trimmed && looked.is_none() }
+    Judged {
+        written,
+        looked,
+        busy: seen.trimmed && looked.is_none(),
+    }
 }
 
 /// Counts an ended store. `how`: 0 the page's next store, 1 none within
@@ -430,7 +450,11 @@ pub(crate) fn stored(id: u64, copy: (u64, u64), at: usize, n: usize, own: bool) 
     if shown.is_empty() || many {
         shown = vec![base];
     }
-    let (clean, stamp) = if own { (crate::watch::clean(page), crate::watch::stamp(page)) } else { (false, 0) };
+    let (clean, stamp) = if own {
+        (crate::watch::clean(page), crate::watch::stamp(page))
+    } else {
+        (false, 0)
+    };
     // Only what went through our own view: its pages stay in physical
     // memory whatever happens to the title's addresses (our view holds
     // them), and the guard tells the title's writes there.
@@ -446,7 +470,16 @@ pub(crate) fn stored(id: u64, copy: (u64, u64), at: usize, n: usize, own: bool) 
     if let Some(old) = old {
         if old.open {
             // A store with no `before` ahead of it: ended unlooked.
-            tally(s, &old, &Judged { written: false, looked: None, busy: old.trimmed }, 0);
+            tally(
+                s,
+                &old,
+                &Judged {
+                    written: false,
+                    looked: None,
+                    busy: old.trimmed,
+                },
+                0,
+            );
         }
         for a in &old.shown {
             s.names.remove(&(a / PAGE));
@@ -475,7 +508,22 @@ pub(crate) fn stored(id: u64, copy: (u64, u64), at: usize, n: usize, own: bool) 
     }
     s.seen.insert(
         page,
-        Seen { id, copy, page, frame, bytes: n as u64, from, to, shown, open: true, own, trimmed, clean, stamp, layer: 0 },
+        Seen {
+            id,
+            copy,
+            page,
+            frame,
+            bytes: n as u64,
+            from,
+            to,
+            shown,
+            open: true,
+            own,
+            trimmed,
+            clean,
+            stamp,
+            layer: 0,
+        },
     );
 }
 
@@ -538,9 +586,15 @@ pub(crate) fn remapped(at: usize, len: usize) {
         return;
     }
     let keys: Vec<usize> = if last - first < s.names.len() {
-        (first..=last).filter_map(|page| s.names.get(&page).copied()).collect()
+        (first..=last)
+            .filter_map(|page| s.names.get(&page).copied())
+            .collect()
     } else {
-        s.names.iter().filter(|(page, _)| (first..=last).contains(*page)).map(|(_, key)| *key).collect()
+        s.names
+            .iter()
+            .filter(|(page, _)| (first..=last).contains(*page))
+            .map(|(_, key)| *key)
+            .collect()
     };
     for key in keys {
         // (A key may be named twice: two addresses of one page.)
@@ -548,7 +602,16 @@ pub(crate) fn remapped(at: usize, len: usize) {
             continue;
         };
         if seen.open {
-            tally(s, &seen, &Judged { written: false, looked: None, busy: false }, 2);
+            tally(
+                s,
+                &seen,
+                &Judged {
+                    written: false,
+                    looked: None,
+                    busy: false,
+                },
+                2,
+            );
         }
         for a in &seen.shown {
             s.names.remove(&(a / PAGE));
@@ -654,12 +717,23 @@ pub(crate) fn line(frames: f64) {
     let old: Vec<Seen> = {
         let mut guard = state();
         let s = guard.get_or_insert_with(State::default);
-        let keys: Vec<usize> = s.seen.iter().filter(|(_, seen)| seen.frame + KEEP < frame).map(|(key, _)| *key).collect();
-        let old: Vec<Seen> = keys.into_iter().filter_map(|key| s.seen.remove(&key)).collect();
+        let keys: Vec<usize> = s
+            .seen
+            .iter()
+            .filter(|(_, seen)| seen.frame + KEEP < frame)
+            .map(|(key, _)| *key)
+            .collect();
+        let old: Vec<Seen> = keys
+            .into_iter()
+            .filter_map(|key| s.seen.remove(&key))
+            .collect();
         old
     };
     // Looked at with no lock of ours held.
-    let judged: Vec<Option<Judged>> = old.iter().map(|seen| seen.open.then(|| judge(seen))).collect();
+    let judged: Vec<Option<Judged>> = old
+        .iter()
+        .map(|seen| seen.open.then(|| judge(seen)))
+        .collect();
     let mut guard = state();
     let s = guard.get_or_insert_with(State::default);
     for (seen, judged) in old.iter().zip(&judged) {
@@ -681,7 +755,10 @@ pub(crate) fn line(frames: f64) {
     if s.frames < EVERY {
         return;
     }
-    let (since, over) = (std::mem::take(&mut s.since), std::mem::replace(&mut s.frames, 0.0));
+    let (since, over) = (
+        std::mem::take(&mut s.since),
+        std::mem::replace(&mut s.frames, 0.0),
+    );
     tracing::info!(
         "what came back from the card and who touched it, per frame over {over:.0} frames (VICTORY_BACK_READS={}): {}",
         std::env::var("VICTORY_BACK_READS").unwrap_or_default(),

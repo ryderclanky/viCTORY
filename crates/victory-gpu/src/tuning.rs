@@ -190,7 +190,10 @@ mod tests {
         let p = choose(32, 10_200);
         assert_eq!(p.targets_room_mb, 3_072);
         assert_eq!(p.room_percent, 90);
-        assert!(!p.levels_on_demand, "levels on demand stays off, as measured");
+        assert!(
+            !p.levels_on_demand,
+            "levels on demand stays off, as measured"
+        );
         assert_eq!(p.staging_mb, 256);
     }
 

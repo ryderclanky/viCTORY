@@ -96,7 +96,9 @@ fn clock_us() -> u64 {
 /// clock, the same seconds in which the fence meter of the graphics side says its own
 /// (`victory_gpu::fence::pace`), so that the two can be laid side by side.
 fn detail_now() -> bool {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).is_ok_and(|d| d.as_secs() % 120 < 4)
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .is_ok_and(|d| d.as_secs() % 120 < 4)
 }
 
 /// Whether the 15-byte `clzero` loop is taken whole (`VICTORY_CLZERO_LOOP15=0`: line by
@@ -144,14 +146,21 @@ fn wait_step() {
 fn line() {
     let now = clock_us() / 1000;
     let last = LINE_AT.load(Relaxed);
-    if now < last + 5_000 || LINE_AT.compare_exchange(last, now, Relaxed, Relaxed).is_err() {
+    if now < last + 5_000
+        || LINE_AT
+            .compare_exchange(last, now, Relaxed, Relaxed)
+            .is_err()
+    {
         return;
     }
     if last == 0 {
         return;
     }
     let seconds = (now - last) as f64 / 1e3;
-    let k: Vec<f64> = KINDS.iter().map(|k| k.swap(0, Relaxed) as f64 / seconds).collect();
+    let k: Vec<f64> = KINDS
+        .iter()
+        .map(|k| k.swap(0, Relaxed) as f64 / seconds)
+        .collect();
     let w: Vec<f64> = WAITS.iter().map(|w| w.swap(0, Relaxed) as f64).collect();
     tracing::info!(
         "console CPU instructions, exceptions a second: clzero alone {:.0}, its 12-byte loop {:.0}, its 15-byte loop taken whole {:.0} ({:.0} lines a second, each an exception \
@@ -176,13 +185,18 @@ fn line() {
 }
 
 fn readable(va: usize, bytes: usize) -> bool {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery};
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+    };
     // SAFETY: plain data filled in by the query.
     let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.
     let found = unsafe { VirtualQuery(va as *const _, &mut m, size_of_val(&m)) } != 0;
     ASKED.fetch_add(1, Relaxed);
-    found && m.State == MEM_COMMIT && m.Protect & (PAGE_NOACCESS | PAGE_GUARD) == 0 && m.BaseAddress as usize + m.RegionSize >= va + bytes
+    found
+        && m.State == MEM_COMMIT
+        && m.Protect & (PAGE_NOACCESS | PAGE_GUARD) == 0
+        && m.BaseAddress as usize + m.RegionSize >= va + bytes
 }
 
 fn writable(va: usize, bytes: usize) -> bool {
@@ -196,12 +210,18 @@ fn writable(va: usize, bytes: usize) -> bool {
 /// on view memory opens as it does any write, and which is a crash otherwise (as the
 /// unchecked single-line emulation behind this one already is).
 fn writable_to(va: usize, end: usize) -> Option<usize> {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE, PAGE_READWRITE, VirtualQuery};
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE, PAGE_READWRITE, VirtualQuery,
+    };
     let remember = remembers();
     if remember {
         let (regions, answers) = WRITABLE.with(Cell::get);
         if let Some(&(_, to)) = regions.iter().find(|&&(from, to)| from <= va && va < to) {
-            let next = if answers >= ANSWERS { ([(0, 0); 4], 0) } else { (regions, answers + 1) };
+            let next = if answers >= ANSWERS {
+                ([(0, 0); 4], 0)
+            } else {
+                (regions, answers + 1)
+            };
             WRITABLE.with(|w| w.set(next));
             return Some(to.min(end));
         }
@@ -211,10 +231,14 @@ fn writable_to(va: usize, end: usize) -> Option<usize> {
     // SAFETY: a valid out pointer of the right size.
     let found = unsafe { VirtualQuery(va as *const _, &mut m, size_of_val(&m)) } != 0;
     ASKED.fetch_add(1, Relaxed);
-    if !found || m.State != MEM_COMMIT || m.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE) == 0 {
+    if !found || m.State != MEM_COMMIT || m.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE) == 0
+    {
         return None;
     }
-    let (from, to) = (m.BaseAddress as usize, m.BaseAddress as usize + m.RegionSize);
+    let (from, to) = (
+        m.BaseAddress as usize,
+        m.BaseAddress as usize + m.RegionSize,
+    );
     if remember {
         WRITABLE.with(|w| {
             let (mut regions, answers) = w.get();
@@ -257,7 +281,11 @@ fn loop15_end(rax: usize, ptr: usize, end: usize) -> Option<usize> {
     if rax & 63 != 0 || ptr != rax.wrapping_add(64) || ptr < rax {
         return None;
     }
-    let more = if ptr < end { (end - ptr).div_ceil(64) } else { 0 };
+    let more = if ptr < end {
+        (end - ptr).div_ceil(64)
+    } else {
+        0
+    };
     let last = ptr.checked_add(more.checked_mul(64)?)?;
     (last - rax < 2 << 30).then_some(last)
 }
@@ -289,7 +317,9 @@ unsafe fn clzero_loop15(ctx: &mut CONTEXT, rip: usize, ptr_reg: u8, end_reg: u8)
     // Region by region, as the 12-byte loop: a block may lie across several views.
     let mut at = rax;
     while at < last {
-        let Some(to) = writable_to(at, last) else { break };
+        let Some(to) = writable_to(at, last) else {
+            break;
+        };
         // A region ends on a page boundary, so `to` is on a line boundary as `at` is.
         // SAFETY: committed and writable from `at` to `to`.
         unsafe { std::ptr::write_bytes(at as *mut u8, 0, to - at) };
@@ -322,7 +352,11 @@ unsafe fn clzero_loop15(ctx: &mut CONTEXT, rip: usize, ptr_reg: u8, end_reg: u8)
 pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
     let rip = ctx.Rip as usize;
     // The same few instructions fault again and again: their bytes are asked about once.
-    let known = if remembers() { CODE.with(Cell::get) } else { [(0, 0); 8] };
+    let known = if remembers() {
+        CODE.with(Cell::get)
+    } else {
+        [(0, 0); 8]
+    };
     let n = match known.iter().find(|&&(at, n)| at == rip && n > 0) {
         Some(&(_, n)) => n,
         None => {
@@ -341,8 +375,11 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
     };
     // SAFETY: `n` bytes at `rip` are readable.
     let code = unsafe { std::slice::from_raw_parts(rip as *const u8, n) };
-    let Some((what, len)) = decode::decode(code) else { return 0 };
-    static SEEN: std::sync::Mutex<Vec<std::mem::Discriminant<ConsoleOnly>>> = std::sync::Mutex::new(Vec::new());
+    let Some((what, len)) = decode::decode(code) else {
+        return 0;
+    };
+    static SEEN: std::sync::Mutex<Vec<std::mem::Discriminant<ConsoleOnly>>> =
+        std::sync::Mutex::new(Vec::new());
     if let Ok(mut seen) = SEEN.lock()
         && !seen.contains(&std::mem::discriminant(&what))
     {
@@ -405,7 +442,8 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
             KINDS[K_LOOP12].fetch_add(1, Relaxed);
             // the whole `clzero; add rax,40h; cmp rax,end; jb` loop at once
             let regs: [u64; 16] = [
-                ctx.Rax, ctx.Rcx, ctx.Rdx, ctx.Rbx, ctx.Rsp, ctx.Rbp, ctx.Rsi, ctx.Rdi, ctx.R8, ctx.R9, ctx.R10, ctx.R11, ctx.R12, ctx.R13, ctx.R14, ctx.R15,
+                ctx.Rax, ctx.Rcx, ctx.Rdx, ctx.Rbx, ctx.Rsp, ctx.Rbp, ctx.Rsi, ctx.Rdi, ctx.R8,
+                ctx.R9, ctx.R10, ctx.R11, ctx.R12, ctx.R13, ctx.R14, ctx.R15,
             ];
             let end = regs[end_reg as usize & 15] as usize;
             let start = ctx.Rax as usize;
@@ -415,7 +453,9 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
                 // which every 64-byte line took an exception of its own.
                 let mut at = start;
                 while at < end {
-                    let Some(to) = writable_to(at, end) else { break };
+                    let Some(to) = writable_to(at, end) else {
+                        break;
+                    };
                     // SAFETY: committed and writable from `at` to `to`.
                     unsafe { std::ptr::write_bytes(at as *mut u8, 0, to - at) };
                     at = to;
@@ -443,10 +483,25 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
         }
         ConsoleOnly::Rdpid(r) => {
             // SAFETY: no preconditions.
-            let cpu = unsafe { windows_sys::Win32::System::Threading::GetCurrentProcessorNumber() } as u64;
+            let cpu = unsafe { windows_sys::Win32::System::Threading::GetCurrentProcessorNumber() }
+                as u64;
             let regs: [&mut u64; 16] = [
-                &mut ctx.Rax, &mut ctx.Rcx, &mut ctx.Rdx, &mut ctx.Rbx, &mut ctx.Rsp, &mut ctx.Rbp, &mut ctx.Rsi, &mut ctx.Rdi, &mut ctx.R8, &mut ctx.R9, &mut ctx.R10, &mut ctx.R11, &mut ctx.R12, &mut ctx.R13,
-                &mut ctx.R14, &mut ctx.R15,
+                &mut ctx.Rax,
+                &mut ctx.Rcx,
+                &mut ctx.Rdx,
+                &mut ctx.Rbx,
+                &mut ctx.Rsp,
+                &mut ctx.Rbp,
+                &mut ctx.Rsi,
+                &mut ctx.Rdi,
+                &mut ctx.R8,
+                &mut ctx.R9,
+                &mut ctx.R10,
+                &mut ctx.R11,
+                &mut ctx.R12,
+                &mut ctx.R13,
+                &mut ctx.R14,
+                &mut ctx.R15,
             ];
             *regs[r as usize & 15] = cpu;
         }
@@ -465,11 +520,21 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
             d.Low = decode::extrq(d.Low, len, idx);
             d.High = 0;
         }
-        ConsoleOnly::Insertq { dst, src, reg, len, idx } => {
+        ConsoleOnly::Insertq {
+            dst,
+            src,
+            reg,
+            len,
+            idx,
+        } => {
             // SAFETY: as above.
             let x = unsafe { &mut ctx.Anonymous.FltSave.XmmRegisters };
             let s = x[src as usize & 15];
-            let (len, idx) = if reg { (s.High as u8, (s.High >> 8) as u8) } else { (len, idx) };
+            let (len, idx) = if reg {
+                (s.High as u8, (s.High >> 8) as u8)
+            } else {
+                (len, idx)
+            };
             let d = &mut x[dst as usize & 15];
             d.Low = decode::insertq(d.Low, s.Low, len, idx);
             d.High = 0;
@@ -477,7 +542,11 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
     }
     if !matches!(
         what,
-        ConsoleOnly::Monitorx | ConsoleOnly::Mwaitx | ConsoleOnly::Clzero | ConsoleOnly::ClzeroStep { .. } | ConsoleOnly::ClzeroLoop { .. }
+        ConsoleOnly::Monitorx
+            | ConsoleOnly::Mwaitx
+            | ConsoleOnly::Clzero
+            | ConsoleOnly::ClzeroStep { .. }
+            | ConsoleOnly::ClzeroLoop { .. }
     ) {
         KINDS[K_OTHER].fetch_add(1, Relaxed);
     }
@@ -514,7 +583,18 @@ mod tests {
 
     #[test]
     fn the_15_byte_loop_ends_where_the_processor_would_end_it() {
-        for (rax, len) in [(0x1000usize, 7040usize), (0x1000, 3264), (0x1000, 3776), (0x1000, 896), (0x4000, 64), (0x4000, 65), (0x4000, 100), (0x4000, 1), (0x4000, 0), (0x8000, 128)] {
+        for (rax, len) in [
+            (0x1000usize, 7040usize),
+            (0x1000, 3264),
+            (0x1000, 3776),
+            (0x1000, 896),
+            (0x4000, 64),
+            (0x4000, 65),
+            (0x4000, 100),
+            (0x4000, 1),
+            (0x4000, 0),
+            (0x8000, 128),
+        ] {
             let (ptr, end) = (rax + 64, rax + len);
             let (lines, last_rax, last_ptr) = by_hand(rax, ptr, end);
             let last = loop15_end(rax, ptr, end).expect("the plain case");
@@ -528,25 +608,46 @@ mod tests {
         // not the plain case: a line not on a boundary, a pointer that is not the next line
         assert_eq!(loop15_end(0x1008, 0x1048, 0x2000), None);
         assert_eq!(loop15_end(0x1000, 0x1080, 0x2000), None);
-        assert_eq!(loop15_end(0x1000, 0x1040, 0x1000 + (3 << 30)), None, "over 2 GiB");
+        assert_eq!(
+            loop15_end(0x1000, 0x1040, 0x1000 + (3 << 30)),
+            None,
+            "over 2 GiB"
+        );
     }
 
     /// The loop as the title has it at +0x4e8ab4c, for the given registers.
     fn code(ptr_reg: u8, end_reg: u8) -> Vec<u8> {
         let (ph, pl, eh, el) = (ptr_reg >> 3, ptr_reg & 7, end_reg >> 3, end_reg & 7);
         vec![
-            0x48 | ph << 2, 0x89, 0xC0 | pl << 3, // mov rax, ptr
-            0x48 | ph, 0x83, 0xC0 | pl, 0x40, // add ptr, 0x40
-            0x0F, 0x01, 0xFC, // clzero
-            0x48 | eh << 2 | ph, 0x39, 0xC0 | el << 3 | pl, // cmp ptr, end
-            0x72, 0xF1, // jb -15
+            0x48 | ph << 2,
+            0x89,
+            0xC0 | pl << 3, // mov rax, ptr
+            0x48 | ph,
+            0x83,
+            0xC0 | pl,
+            0x40, // add ptr, 0x40
+            0x0F,
+            0x01,
+            0xFC, // clzero
+            0x48 | eh << 2 | ph,
+            0x39,
+            0xC0 | el << 3 | pl, // cmp ptr, end
+            0x72,
+            0xF1, // jb -15
             0x90,
         ]
     }
 
     #[test]
     fn the_15_byte_loop_is_zeroed_whole_and_leaves_the_loop_s_registers() {
-        for (ptr_reg, end_reg, len) in [(10u8, 11u8, 7040usize), (9, 10, 3264), (8, 9, 3776), (2, 8, 896), (10, 11, 64), (10, 11, 100)] {
+        for (ptr_reg, end_reg, len) in [
+            (10u8, 11u8, 7040usize),
+            (9, 10, 3264),
+            (8, 9, 3776),
+            (2, 8, 896),
+            (10, 11, 64),
+            (10, 11, 100),
+        ] {
             let code = code(ptr_reg, end_reg);
             // a block of 0xAA with room on both sides, its start on a line boundary
             let mut block = vec![0xAAu8; 16384];
@@ -563,12 +664,25 @@ mod tests {
             assert_eq!(ctx.Rip, code.as_ptr() as u64 + 10, "at the loop's own cmp");
             assert_eq!(ctx.Rax as usize, last_rax);
             assert_eq!(*register(&mut ctx, ptr_reg) as usize, last_ptr);
-            assert_eq!(*register(&mut ctx, end_reg) as usize, base + len, "the end is left alone");
+            assert_eq!(
+                *register(&mut ctx, end_reg) as usize,
+                base + len,
+                "the end is left alone"
+            );
             let zeroed = lines.len() * 64;
             let at = base - block.as_ptr() as usize;
-            assert!(block[at..at + zeroed].iter().all(|&b| b == 0), "{zeroed} bytes zeroed");
-            assert!(block[..at].iter().all(|&b| b == 0xAA), "nothing before the block");
-            assert!(block[at + zeroed..].iter().all(|&b| b == 0xAA), "nothing after its last line");
+            assert!(
+                block[at..at + zeroed].iter().all(|&b| b == 0),
+                "{zeroed} bytes zeroed"
+            );
+            assert!(
+                block[..at].iter().all(|&b| b == 0xAA),
+                "nothing before the block"
+            );
+            assert!(
+                block[at + zeroed..].iter().all(|&b| b == 0xAA),
+                "nothing after its last line"
+            );
         }
     }
 
@@ -588,7 +702,11 @@ mod tests {
         // SAFETY: the context points at the code above.
         assert_eq!(unsafe { emulate(&mut ctx) }, CONTINUE_EXECUTION);
         assert_eq!(ctx.Rip, code.as_ptr() as u64 + 10);
-        assert_eq!((ctx.Rax, ctx.R10), (base as u64, base as u64 + 64), "registers untouched");
+        assert_eq!(
+            (ctx.Rax, ctx.R10),
+            (base as u64, base as u64 + 64),
+            "registers untouched"
+        );
         let at = base - block.as_ptr() as usize;
         assert!(block[at..at + 64].iter().all(|&b| b == 0));
         assert!(block[at + 64..].iter().all(|&b| b == 0xAA), "one line only");

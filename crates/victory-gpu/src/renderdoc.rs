@@ -69,8 +69,13 @@ pub(crate) fn load() {
         };
         let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
         // SAFETY: a NUL-terminated full path, named by the user.
-        let module =
-            unsafe { LoadLibraryExW(wide.as_ptr(), std::ptr::null_mut(), LOAD_WITH_ALTERED_SEARCH_PATH) };
+        let module = unsafe {
+            LoadLibraryExW(
+                wide.as_ptr(),
+                std::ptr::null_mut(),
+                LOAD_WITH_ALTERED_SEARCH_PATH,
+            )
+        };
         if module.is_null() {
             tracing::warn!(path = %path.display(), "VICTORY_RENDERDOC: the DLL does not load");
             return None;
@@ -101,9 +106,9 @@ pub(crate) fn load() {
         if let Ok(name) = std::ffi::CString::new(out.to_string_lossy().as_bytes()) {
             // SAFETY: the entry's signature; a NUL-terminated string it copies.
             unsafe {
-                api.entry::<unsafe extern "C" fn(*const std::ffi::c_char)>(SET_CAPTURE_FILE_PATH_TEMPLATE)(
-                    name.as_ptr(),
-                );
+                api.entry::<unsafe extern "C" fn(*const std::ffi::c_char)>(
+                    SET_CAPTURE_FILE_PATH_TEMPLATE,
+                )(name.as_ptr());
             }
         }
         tracing::info!(

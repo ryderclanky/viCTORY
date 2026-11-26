@@ -97,7 +97,21 @@ static SUBMITTED: AtomicU32 = AtomicU32::new(0);
 
 /// Whether the title has begun to submit the frame being recorded.
 fn closing() -> bool {
-    SUBMITTED.load(Relaxed) >= FRAME_LISTS
+    SUBMITTED.load(Relaxed) >= frame_lists()
+}
+
+/// [`FRAME_LISTS`], or `VICTORY_SHOT_LISTS` if set. The title may go on
+/// beginning lists of a frame long after its first twenty are submitted:
+/// shot-1785-012256 (run 287) had 34 lists submitted before the frame's
+/// lighting lists were begun, took those for the next frame's and holds
+/// none of their commands. A number no frame reaches keeps every list
+/// begun until the shot's last present (three presents at most): more
+/// than one frame, with nothing of it left out.
+fn frame_lists() -> u32 {
+    static LISTS: OnceLock<u32> = OnceLock::new();
+    *LISTS.get_or_init(|| {
+        number("VICTORY_SHOT_LISTS", u64::from(FRAME_LISTS)).min(u64::from(u32::MAX)) as u32
+    })
 }
 
 /// The title submits `list`, while a shot records.
@@ -138,14 +152,21 @@ fn folder() -> Option<&'static PathBuf> {
 }
 
 fn number(name: &str, default: u64) -> u64 {
-    std::env::var(name).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(default)
 }
 
 /// `VICTORY_SHOT_AT`: frames counted from the first one of 500 draws.
 fn at() -> &'static [u64] {
     static AT: OnceLock<Vec<u64>> = OnceLock::new();
     AT.get_or_init(|| {
-        std::env::var("VICTORY_SHOT_AT").unwrap_or_default().split(',').filter_map(|f| f.trim().parse().ok()).collect()
+        std::env::var("VICTORY_SHOT_AT")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|f| f.trim().parse().ok())
+            .collect()
     })
 }
 
@@ -283,14 +304,20 @@ fn make_clock() -> Option<Clock> {
     let device = host.device();
     let mut heap: Option<ID3D12QueryHeap> = None;
     let mut back: Option<ID3D12Resource> = None;
-    let readback = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
+    let readback = D3D12_HEAP_PROPERTIES {
+        Type: D3D12_HEAP_TYPE_READBACK,
+        ..Default::default()
+    };
     let desc = D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
         Width: u64::from(SLOTS) * 8,
         Height: 1,
         DepthOrArraySize: 1,
         MipLevels: 1,
-        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
         Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
         ..Default::default()
     };
@@ -298,10 +325,24 @@ fn make_clock() -> Option<Clock> {
     // (the card meter's heap and buffer, made the same way).
     unsafe {
         device
-            .CreateQueryHeap(&D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: SLOTS, NodeMask: 0 }, &mut heap)
+            .CreateQueryHeap(
+                &D3D12_QUERY_HEAP_DESC {
+                    Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP,
+                    Count: SLOTS,
+                    NodeMask: 0,
+                },
+                &mut heap,
+            )
             .ok()?;
         device
-            .CreateCommittedResource(&readback, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut back)
+            .CreateCommittedResource(
+                &readback,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                None,
+                &mut back,
+            )
             .ok()?;
         let (heap, back) = (heap?, back?);
         let mut mapped = std::ptr::null_mut();
@@ -310,7 +351,12 @@ fn make_clock() -> Option<Clock> {
         if mapped.is_null() || frequency == 0 {
             return None;
         }
-        Some(Clock { heap, back, mapped: mapped as usize, frequency })
+        Some(Clock {
+            heap,
+            back,
+            mapped: mapped as usize,
+            frequency,
+        })
     }
 }
 
@@ -345,7 +391,16 @@ fn take_block() -> Option<u32> {
 fn resolve(list: &ID3D12GraphicsCommandList, clock: &Clock, id: u32, base: u32, count: u32) {
     // SAFETY: an open list, our heap and our read-back buffer; the places
     // are the block's own, and each was ended in this list before.
-    unsafe { list.ResolveQueryData(&clock.heap, D3D12_QUERY_TYPE_TIMESTAMP, base, count, &clock.back, u64::from(base) * 8) };
+    unsafe {
+        list.ResolveQueryData(
+            &clock.heap,
+            D3D12_QUERY_TYPE_TIMESTAMP,
+            base,
+            count,
+            &clock.back,
+            u64::from(base) * 8,
+        )
+    };
     let mut shot = SHOT.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(s) = shot.as_mut().filter(|s| s.id == id) {
         s.resolved.push((base, count));
@@ -370,7 +425,11 @@ pub(crate) fn stamp(list: &crate::host::HostList) {
                 NEXT_FRAME.set(true);
                 return;
             }
-            let lines = SHOT.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(0, |s| s.events.len());
+            let lines = SHOT
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .map_or(0, |s| s.events.len());
             *mark = (id, lines as u32);
         }
     }
@@ -384,7 +443,10 @@ pub(crate) fn stamp(list: &crate::host::HostList) {
     let (base, used, of) = *block;
     let end = |slot: u32| {
         // SAFETY: an open list and a place of our heap.
-        unsafe { list.list.EndQuery(&clock.heap, D3D12_QUERY_TYPE_TIMESTAMP, slot) };
+        unsafe {
+            list.list
+                .EndQuery(&clock.heap, D3D12_QUERY_TYPE_TIMESTAMP, slot)
+        };
     };
     let slot = if used == 0 || of != id {
         let Some(base) = take_block() else { return };
@@ -421,7 +483,10 @@ pub(crate) fn close(list: &crate::host::HostList) {
     };
     // SAFETY: an open list and a place of our heap (a block always keeps
     // its last place for this).
-    unsafe { list.list.EndQuery(&clock.heap, D3D12_QUERY_TYPE_TIMESTAMP, base + used) };
+    unsafe {
+        list.list
+            .EndQuery(&clock.heap, D3D12_QUERY_TYPE_TIMESTAMP, base + used)
+    };
     resolve(&list.list, clock, of, base, used + 1);
 }
 
@@ -448,7 +513,12 @@ pub(crate) fn span_begin(cmd: &ID3D12GraphicsCommandList) -> u32 {
 
 /// The list [`span_begin`] timed ends here; `what` is its line, for the
 /// title list `list` or none.
-pub(crate) fn span_end(cmd: &ID3D12GraphicsCommandList, slot: u32, list: usize, what: impl FnOnce() -> String) {
+pub(crate) fn span_end(
+    cmd: &ID3D12GraphicsCommandList,
+    slot: u32,
+    list: usize,
+    what: impl FnOnce() -> String,
+) {
     if slot == u32::MAX {
         return;
     }
@@ -459,7 +529,14 @@ pub(crate) fn span_end(cmd: &ID3D12GraphicsCommandList, slot: u32, list: usize, 
     // `span_begin` took.
     unsafe {
         cmd.EndQuery(&clock.heap, D3D12_QUERY_TYPE_TIMESTAMP, slot + 1);
-        cmd.ResolveQueryData(&clock.heap, D3D12_QUERY_TYPE_TIMESTAMP, slot, 2, &clock.back, u64::from(slot) * 8);
+        cmd.ResolveQueryData(
+            &clock.heap,
+            D3D12_QUERY_TYPE_TIMESTAMP,
+            slot,
+            2,
+            &clock.back,
+            u64::from(slot) * 8,
+        );
     }
     let mut shot = SHOT.lock().unwrap_or_else(|e| e.into_inner());
     let Some(s) = shot.as_mut() else { return };
@@ -469,7 +546,12 @@ pub(crate) fn span_end(cmd: &ID3D12GraphicsCommandList, slot: u32, list: usize, 
     s.resolved.push((slot, 2));
     // SAFETY: a plain query.
     let thread = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
-    s.events.push(Event { list, thread, stamp: slot, text: what() });
+    s.events.push(Event {
+        list,
+        thread,
+        stamp: slot,
+        text: what(),
+    });
 }
 
 /// A line of `capture::op`, while a shot's first frame records.
@@ -483,12 +565,20 @@ pub(crate) fn line(list: usize, text: &str) {
     if s.stopped.is_some() || s.carry.parts != 0 || s.events.len() >= MAX_EVENTS {
         return;
     }
-    if ["draw ", "indexed ", "mesh ", "indirect ", "dispatch "].iter().any(|k| text.starts_with(k)) {
+    if ["draw ", "indexed ", "mesh ", "indirect ", "dispatch "]
+        .iter()
+        .any(|k| text.starts_with(k))
+    {
         s.work += 1;
     }
     // SAFETY: a plain query.
     let thread = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
-    s.events.push(Event { list, thread, stamp, text: text.to_owned() });
+    s.events.push(Event {
+        list,
+        thread,
+        stamp,
+        text: text.to_owned(),
+    });
 }
 
 /// Whether pictures of host format `format` can be shown
@@ -551,12 +641,21 @@ pub(crate) fn leaves(
     let texture = &copy.texture;
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
-    if d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.SampleDesc.Count > 1 || !shows(d.Format.0) {
+    if d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        || d.SampleDesc.Count > 1
+        || !shows(d.Format.0)
+    {
         return;
     }
-    let Some(host) = crate::host::host() else { return };
+    let Some(host) = crate::host::host() else {
+        return;
+    };
     let key = std::sync::Arc::as_ptr(copy) as usize;
-    let slices = if d.DepthOrArraySize <= 6 { u32::from(d.DepthOrArraySize) } else { 1 };
+    let slices = if d.DepthOrArraySize <= 6 {
+        u32::from(d.DepthOrArraySize)
+    } else {
+        1
+    };
     // In the title's own list the copy gets a timestamp of its own, so
     // its time is not the command's before it. (A list of the next frame
     // has no places.)
@@ -583,7 +682,10 @@ pub(crate) fn leaves(
         let sub = slice * u32::from(d.MipLevels);
         let mut total = 0u64;
         // SAFETY: a live device; outputs for one subresource.
-        unsafe { host.device().GetCopyableFootprints(&d, sub, 1, 0, None, None, None, Some(&mut total)) };
+        unsafe {
+            host.device()
+                .GetCopyableFootprints(&d, sub, 1, 0, None, None, None, Some(&mut total))
+        };
         // Whether the place's picture is taken in this frame; the line of
         // a frame that keeps lines says which.
         {
@@ -598,11 +700,18 @@ pub(crate) fn leaves(
                 d.Width,
                 d.Height,
                 d.Format.0,
-                begins.map_or(String::new(), |b| format!(" at the start of the recording that begins at line {b}"))
+                begins.map_or(String::new(), |b| format!(
+                    " at the start of the recording that begins at line {b}"
+                ))
             );
             let say = |s: &mut Shot, word: &str, why: &str| {
                 if first && s.events.len() < MAX_EVENTS {
-                    s.events.push(Event { list, thread, stamp: if slice == 0 { stamp } else { u32::MAX }, text: format!("{word} {what}{why}") });
+                    s.events.push(Event {
+                        list,
+                        thread,
+                        stamp: if slice == 0 { stamp } else { u32::MAX },
+                        text: format!("{word} {what}{why}"),
+                    });
                 }
             };
             // The same in every frame: a texture's ninth place on, and a
@@ -645,10 +754,15 @@ pub(crate) fn leaves(
             }
             moved = true;
         }
-        let Some((buffer, footprint)) = crate::capture::read_back_of(host.device(), cmd, texture, sub) else {
+        let Some((buffer, footprint)) =
+            crate::capture::read_back_of(host.device(), cmd, texture, sub)
+        else {
             continue;
         };
-        let name = format!("snap-{title:x}-n{occurrence}-s{slice}-{}x{}-f{}", d.Width, d.Height, d.Format.0);
+        let name = format!(
+            "snap-{title:x}-n{occurrence}-s{slice}-{}x{}-f{}",
+            d.Width, d.Height, d.Format.0
+        );
         let mut shot = SHOT.lock().unwrap_or_else(|e| e.into_inner());
         let Some(s) = shot.as_mut() else { break };
         s.snaps.push(Snap {
@@ -685,7 +799,10 @@ static WORLD: AtomicU64 = AtomicU64::new(u64::MAX);
 fn trigger(folder: &std::path::Path, frame: u64) -> Option<String> {
     let world = WORLD.load(Relaxed);
     if world != u64::MAX && at().contains(&(frame + 1 - world)) {
-        return Some(format!("frame {} after the first one of 500 draws (VICTORY_SHOT_AT)", frame + 1 - world));
+        return Some(format!(
+            "frame {} after the first one of 500 draws (VICTORY_SHOT_AT)",
+            frame + 1 - world
+        ));
     }
     // The file is looked for at every fourth present.
     if frame.is_multiple_of(4) {
@@ -727,9 +844,21 @@ pub(crate) fn present(frame: u64, drawn: u64) {
                 static TAKEN: AtomicU32 = AtomicU32::new(0);
                 let most = number("VICTORY_SHOT_MAX", 12);
                 if u64::from(TAKEN.fetch_add(1, Relaxed)) >= most {
-                    tracing::warn!(most, "frame shot not taken: the run has its most already (VICTORY_SHOT_MAX)");
+                    tracing::warn!(
+                        most,
+                        "frame shot not taken: the run has its most already (VICTORY_SHOT_MAX)"
+                    );
                 } else {
-                    arm(frame + 1, Carry { first: frame + 1, why, began: hhmmss(), ..Default::default() }, folder);
+                    arm(
+                        frame + 1,
+                        Carry {
+                            first: frame + 1,
+                            why,
+                            began: hhmmss(),
+                            ..Default::default()
+                        },
+                        folder,
+                    );
                 }
             }
         }
@@ -747,9 +876,18 @@ pub(crate) fn present(frame: u64, drawn: u64) {
                 let text = format!(
                     "PRESENT frame {frame}: {} draws and dispatches recorded since the shot began{}",
                     s.work,
-                    if goes_on { "; the shot goes on through the next frame" } else { "" }
+                    if goes_on {
+                        "; the shot goes on through the next frame"
+                    } else {
+                        ""
+                    }
                 );
-                s.events.push(Event { list: 0, thread: 0, stamp: u32::MAX, text });
+                s.events.push(Event {
+                    list: 0,
+                    thread: 0,
+                    stamp: u32::MAX,
+                    text,
+                });
             }
             if !goes_on {
                 s.stopped = Some((std::time::Instant::now(), frame));
@@ -771,16 +909,20 @@ pub(crate) fn present(frame: u64, drawn: u64) {
             let ready = shot
                 .as_ref()
                 .and_then(|s| s.stopped)
-                .is_some_and(|(when, of)| when.elapsed() >= std::time::Duration::from_secs(2) && frame >= of + 8);
+                .is_some_and(|(when, of)| {
+                    when.elapsed() >= std::time::Duration::from_secs(2) && frame >= of + 8
+                });
             if ready && let Some(s) = shot.take() {
                 PHASE.store(SAVING, Relaxed);
                 let to = folder.join(s.carry.folder_name());
-                let spawned = std::thread::Builder::new().name("victory-shot".into()).spawn(move || {
-                    crate::framelog::keep_on_slow_cores("frame shot");
-                    let next = save(s, &to);
-                    *WAITING.lock().unwrap_or_else(|e| e.into_inner()) = next;
-                    PHASE.store(IDLE, Relaxed);
-                });
+                let spawned = std::thread::Builder::new()
+                    .name("victory-shot".into())
+                    .spawn(move || {
+                        crate::framelog::keep_on_slow_cores("frame shot");
+                        let next = save(s, &to);
+                        *WAITING.lock().unwrap_or_else(|e| e.into_inner()) = next;
+                        PHASE.store(IDLE, Relaxed);
+                    });
                 if let Err(e) = spawned {
                     tracing::warn!(error = %e, "frame shot: no thread to write it out; dropped");
                     PHASE.store(IDLE, Relaxed);
@@ -802,7 +944,12 @@ fn arm(frame: u64, carry: Carry, folder: &std::path::Path) {
                 part = carry.parts,
                 "frame shot ends here: too little memory free for more of its pictures"
             );
-            finish(&carry, &folder.join(carry.folder_name()), "ended early: too little memory free for more pictures", 0);
+            finish(
+                &carry,
+                &folder.join(carry.folder_name()),
+                "ended early: too little memory free for more pictures",
+                0,
+            );
             return;
         }
         // The lines and times need none of it.
@@ -845,6 +992,40 @@ fn arm(frame: u64, carry: Carry, folder: &std::path::Path) {
     PHASE.store(RECORDING, Relaxed);
 }
 
+/// How much of a picture's texture holds anything, from its bytes as the
+/// card wrote them: the share of texels with any bit set and, for R32_UINT
+/// (the title's packed light, read back as R9G9B9E5), the highest channel
+/// value of that reading. The picture says neither: it is scaled to its
+/// largest value, so one bright texel leaves every other one black
+/// (shot-2705: the screen probes' atlas, "0.0 % not black", one white pixel).
+fn holds(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> (f64, f32) {
+    let n = match format {
+        1..=2 => 16,
+        9..=16 | 19..=22 => 8,
+        23..=47 | 87..=93 => 4,
+        48..=59 => 2,
+        60..=65 => 1,
+        _ => return (f64::NAN, 0.0),
+    };
+    let (mut set, mut high) = (0u64, 0f32);
+    for y in 0..h {
+        let Some(row) = rows.get(y * pitch..y * pitch + w * n) else {
+            break;
+        };
+        for texel in row.chunks_exact(n) {
+            set += u64::from(texel.iter().any(|&b| b != 0));
+            if format == 42 {
+                let v = u32::from_le_bytes([texel[0], texel[1], texel[2], texel[3]]);
+                let scale = 2f32.powi((v >> 27) as i32 - 24);
+                for k in 0..3 {
+                    high = high.max((v >> (9 * k) & 0x1ff) as f32 * scale);
+                }
+            }
+        }
+    }
+    (set as f64 * 100.0 / (w * h).max(1) as f64, high)
+}
+
 /// Writes one frame of a shot out and lets its buffers go. What the shot
 /// carries on, if pictures are left for a later frame.
 fn save(shot: Shot, to: &std::path::Path) -> Option<Carry> {
@@ -861,8 +1042,18 @@ fn save(shot: Shot, to: &std::path::Path) -> Option<Carry> {
         // Lines: place, list, thread, timestamp's place (-1: none), text.
         let mut events = String::with_capacity(shot.events.iter().map(|e| e.text.len() + 40).sum());
         for (seq, e) in shot.events.iter().enumerate() {
-            let stamp = if e.stamp == u32::MAX { -1 } else { i64::from(e.stamp) };
-            let _ = writeln!(events, "{seq}\t{:#x}\t{}\t{stamp}\t{}", e.list, e.thread, e.text.replace(['\n', '\r', '\t'], " "));
+            let stamp = if e.stamp == u32::MAX {
+                -1
+            } else {
+                i64::from(e.stamp)
+            };
+            let _ = writeln!(
+                events,
+                "{seq}\t{:#x}\t{}\t{stamp}\t{}",
+                e.list,
+                e.thread,
+                e.text.replace(['\n', '\r', '\t'], " ")
+            );
         }
         if let Err(e) = std::fs::write(to.join("events.txt"), events) {
             tracing::warn!(error = %e, folder = %to.display(), "frame shot: its lines could not be written");
@@ -876,7 +1067,9 @@ fn save(shot: Shot, to: &std::path::Path) -> Option<Carry> {
                     // SAFETY: a place inside the mapped read-back buffer,
                     // which the card wrote long ago (or never: then what
                     // it held).
-                    let ticks = unsafe { std::ptr::read_volatile((clock.mapped as *const u64).add(slot as usize)) };
+                    let ticks = unsafe {
+                        std::ptr::read_volatile((clock.mapped as *const u64).add(slot as usize))
+                    };
                     let _ = writeln!(stamps, "{slot}\t{ticks}");
                 }
             }
@@ -884,7 +1077,7 @@ fn save(shot: Shot, to: &std::path::Path) -> Option<Carry> {
         let _ = std::fs::write(to.join("stamps.txt"), stamps);
         let _ = std::fs::write(
             to.join("snaps.txt"),
-            "texture\tn\tslice\tfile\tpart\tframe\twidth\theight\tformat\tbefore\tafter\tnot_black_percent\tmean_rgb\n",
+            "texture\tn\tslice\tfile\tpart\tframe\twidth\theight\tformat\tbefore\tafter\tnot_black_percent\tmean_rgb\ttexels_with_bits_percent\tpacked_high\n",
         );
         carry.lines = shot.events.len();
         carry.work = shot.work;
@@ -899,6 +1092,7 @@ fn save(shot: Shot, to: &std::path::Path) -> Option<Carry> {
     for snap in shot.snaps {
         let f = snap.footprint;
         let mut data = std::ptr::null_mut();
+        let mut held = (f64::NAN, 0f32);
         // SAFETY: the copy finished long ago; the mapping spans the bytes
         // the footprint was sized for.
         let rgba = unsafe {
@@ -906,7 +1100,20 @@ fn save(shot: Shot, to: &std::path::Path) -> Option<Carry> {
                 None
             } else {
                 let rows = std::slice::from_raw_parts(data.cast::<u8>(), snap.bytes as usize);
-                let rgba = crate::capture::to_rgba(f.Format.0 as u32, f.Width as usize, f.Height as usize, f.RowPitch as usize, rows);
+                let rgba = crate::capture::to_rgba(
+                    f.Format.0 as u32,
+                    f.Width as usize,
+                    f.Height as usize,
+                    f.RowPitch as usize,
+                    rows,
+                );
+                held = holds(
+                    f.Format.0 as u32,
+                    f.Width as usize,
+                    f.Height as usize,
+                    f.RowPitch as usize,
+                    rows,
+                );
                 snap.buffer.Unmap(0, None);
                 rgba
             }
@@ -916,8 +1123,15 @@ fn save(shot: Shot, to: &std::path::Path) -> Option<Carry> {
             continue;
         };
         // Every `step`th pixel each way: 1280 across at most, unless asked.
-        let step = if full { 1 } else { (f.Width.max(f.Height) as usize).div_ceil(1280).max(1) };
-        let (w, h) = ((f.Width as usize).div_ceil(step), (f.Height as usize).div_ceil(step));
+        let step = if full {
+            1
+        } else {
+            (f.Width.max(f.Height) as usize).div_ceil(1280).max(1)
+        };
+        let (w, h) = (
+            (f.Width as usize).div_ceil(step),
+            (f.Height as usize).div_ceil(step),
+        );
         let mut raw = Vec::with_capacity((w * 3 + 1) * h);
         let (mut lit, mut sum) = (0u64, [0u64; 3]);
         for y in 0..h {
@@ -932,7 +1146,10 @@ fn save(shot: Shot, to: &std::path::Path) -> Option<Carry> {
             }
         }
         let n = (w * h).max(1) as u64;
-        match std::fs::write(to.join(format!("{}.png", snap.name)), crate::capture::png_rgb(w as u32, h as u32, &raw)) {
+        match std::fs::write(
+            to.join(format!("{}.png", snap.name)),
+            crate::capture::png_rgb(w as u32, h as u32, &raw),
+        ) {
             Ok(()) => saved += 1,
             Err(_) => {
                 failed += 1;
@@ -941,7 +1158,7 @@ fn save(shot: Shot, to: &std::path::Path) -> Option<Carry> {
         }
         let _ = writeln!(
             list,
-            "{:#x}\t{}\t{}\t{}.png\t{part}\t{}\t{}\t{}\t{}\t{:#x}\t{:#x}\t{:.1}\t{},{},{}",
+            "{:#x}\t{}\t{}\t{}.png\t{part}\t{}\t{}\t{}\t{}\t{:#x}\t{:#x}\t{:.1}\t{},{},{}\t{:.3}\t{}",
             snap.texture,
             snap.occurrence,
             snap.slice,
@@ -955,10 +1172,16 @@ fn save(shot: Shot, to: &std::path::Path) -> Option<Carry> {
             lit as f64 * 100.0 / n as f64,
             sum[0] / n,
             sum[1] / n,
-            sum[2] / n
+            sum[2] / n,
+            held.0,
+            held.1
         );
     }
-    if let Ok(mut file) = std::fs::OpenOptions::new().append(true).create(true).open(to.join("snaps.txt")) {
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(to.join("snaps.txt"))
+    {
         let _ = file.write_all(list.as_bytes());
     }
     carry.parts += 1;
@@ -980,7 +1203,12 @@ fn save(shot: Shot, to: &std::path::Path) -> Option<Carry> {
         finish(&carry, to, "complete", 0);
         None
     } else if (saved == 0 && part != 0) || carry.parts >= MAX_PARTS {
-        finish(&carry, to, "ended early: a frame got no further picture", shot.later);
+        finish(
+            &carry,
+            to,
+            "ended early: a frame got no further picture",
+            shot.later,
+        );
         None
     } else {
         Some(carry)
@@ -1028,7 +1256,10 @@ mod tests {
         for format in (1..=2).chain(9..=16).chain(19..=65).chain(87..=93) {
             assert!(super::shows(format));
             let pixel = [0u8; 16];
-            assert!(crate::capture::to_rgba(format as u32, 1, 1, 16, &pixel).is_some(), "format {format}");
+            assert!(
+                crate::capture::to_rgba(format as u32, 1, 1, 16, &pixel).is_some(),
+                "format {format}"
+            );
         }
         assert!(!super::shows(71));
         assert!(crate::capture::to_rgba(71, 1, 1, 16, &[0u8; 16]).is_none());

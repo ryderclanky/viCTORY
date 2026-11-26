@@ -54,8 +54,7 @@ fn kinds() -> &'static [(u64, u32, u32)] {
 /// Whether title texture `resource` is of a kind copied back.
 pub(crate) fn wanted(resource: This) -> bool {
     let kinds = kinds();
-    !kinds.is_empty()
-        && crate::resource::texture_kind(resource).is_some_and(|k| kinds.contains(&k))
+    !kinds.is_empty() && crate::resource::texture_kind(resource).is_some_and(|k| kinds.contains(&k))
 }
 
 /// An outstanding write to a specific allocation. Mapping and resource
@@ -71,7 +70,12 @@ static TICKETS: Mutex<Vec<Weak<Ticket>>> = Mutex::new(Vec::new());
 static TRACKING: AtomicBool = AtomicBool::new(false);
 
 fn track(owner: usize, at: usize, end: usize) -> Arc<Ticket> {
-    let ticket = Arc::new(Ticket { owner, at, end, valid: AtomicBool::new(true) });
+    let ticket = Arc::new(Ticket {
+        owner,
+        at,
+        end,
+        valid: AtomicBool::new(true),
+    });
     let mut tickets = TICKETS.lock().unwrap_or_else(|e| e.into_inner());
     tickets.retain(|weak| weak.strong_count() != 0);
     tickets.push(Arc::downgrade(&ticket));
@@ -83,13 +87,18 @@ fn invalidate(matches: impl Fn(&Ticket) -> bool) {
     if !TRACKING.load(Ordering::Relaxed) {
         return;
     }
-    TICKETS.lock().unwrap_or_else(|e| e.into_inner()).retain(|weak| {
-        let Some(ticket) = weak.upgrade() else { return false };
-        if matches(&ticket) {
-            ticket.valid.store(false, Ordering::Release);
-        }
-        true
-    });
+    TICKETS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|weak| {
+            let Some(ticket) = weak.upgrade() else {
+                return false;
+            };
+            if matches(&ticket) {
+                ticket.valid.store(false, Ordering::Release);
+            }
+            true
+        });
 }
 
 pub(crate) fn released(owner: usize) {
@@ -119,10 +128,16 @@ impl Target {
         let (layout, at, size) = crate::resource::title_texture(resource)?;
         let end = at.checked_add(size).filter(|&end| at != 0 && end > at)?;
         let ticket = track(resource as usize, at, end);
-        Some(Self { copy, layout, ticket })
+        Some(Self {
+            copy,
+            layout,
+            ticket,
+        })
     }
 
-    pub(crate) fn owner(&self) -> usize { self.ticket.owner }
+    pub(crate) fn owner(&self) -> usize {
+        self.ticket.owner
+    }
 }
 
 /// The readback resources and the allocation the pixels belong to.
@@ -179,23 +194,39 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option
         total = total.max(footprint.Offset.checked_add(pitched)?);
     }
     let buffer = host.read_back_buffer(total)?;
+    // With device-removed data on: a page fault in it, alive or freed, is
+    // reported under this name (it was "unnamed").
+    crate::host::name_frame(&buffer, || {
+        format!("texback read-back buffer of {total} bytes")
+    });
     for (i, footprint) in footprints.iter().enumerate() {
         let to = D3D12_TEXTURE_COPY_LOCATION {
             // SAFETY: a borrowed pointer the location never releases.
             pResource: unsafe { std::mem::transmute_copy(&buffer) },
             Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: *footprint },
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                PlacedFootprint: *footprint,
+            },
         };
         let from = D3D12_TEXTURE_COPY_LOCATION {
             // SAFETY: as above.
             pResource: unsafe { std::mem::transmute_copy(texture) },
             Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: i as u32 },
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                SubresourceIndex: i as u32,
+            },
         };
         // SAFETY: an open list; the texture is in the copy-source state.
         unsafe { list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
     }
-    Some(Back { buffer, footprints, rows, mips, layout: target.layout, ticket: target.ticket })
+    Some(Back {
+        buffer,
+        footprints,
+        rows,
+        mips,
+        layout: target.layout,
+        ticket: target.ticket,
+    })
 }
 
 /// Once the list has run, tile its texels back into the same title allocation.
@@ -207,7 +238,10 @@ pub(crate) fn land(back: &Back) {
     if !back.ticket.valid.load(Ordering::Acquire) {
         let skipped = STALE.fetch_add(1, Ordering::Relaxed) + 1;
         if skipped.is_power_of_two() {
-            tracing::info!(skipped, "skipping texture readbacks whose title allocation changed");
+            tracing::info!(
+                skipped,
+                "skipping texture readbacks whose title allocation changed"
+            );
         }
         return;
     }
@@ -231,10 +265,17 @@ pub(crate) fn land(back: &Back) {
         let pitch = f.RowPitch as usize;
         let len = pitch * rows as usize * f.Depth as usize;
         // SAFETY: the subresource's part of the mapped buffer.
-        let linear = unsafe { std::slice::from_raw_parts(data.cast::<u8>().add(footprint.Offset as usize), len) };
-        if let Err(e) = back.layout.tile(&mut tiled, mip, slice, linear, pitch, pitch * rows as usize) {
+        let linear = unsafe {
+            std::slice::from_raw_parts(data.cast::<u8>().add(footprint.Offset as usize), len)
+        };
+        if let Err(e) =
+            back.layout
+                .tile(&mut tiled, mip, slice, linear, pitch, pitch * rows as usize)
+        {
             static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!(?e, mip, slice, "a texture copied back could not be tiled"));
+            ONCE.call_once(|| {
+                tracing::warn!(?e, mip, slice, "a texture copied back could not be tiled")
+            });
             // SAFETY: mapped above.
             unsafe { back.buffer.Unmap(0, None) };
             return;
@@ -248,7 +289,6 @@ pub(crate) fn land(back: &Back) {
         tracing::info!(copied, bytes = size, "texture readback landed");
     }
 }
-
 
 #[cfg(test)]
 mod tests {

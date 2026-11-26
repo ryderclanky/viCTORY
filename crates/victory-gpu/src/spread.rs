@@ -26,11 +26,13 @@
 use std::collections::HashMap;
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
-use windows_sys::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next};
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+};
 use windows_sys::Win32::System::SystemInformation::GROUP_AFFINITY;
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, GetCurrentProcessId, GetProcessAffinityMask, GetThreadGroupAffinity, OpenThread, SetThreadGroupAffinity, THREAD_QUERY_INFORMATION,
-    THREAD_SET_INFORMATION,
+    GetCurrentProcess, GetCurrentProcessId, GetProcessAffinityMask, GetThreadGroupAffinity,
+    OpenThread, SetThreadGroupAffinity, THREAD_QUERY_INFORMATION, THREAD_SET_INFORMATION,
 };
 
 /// 0 off, 1 on, 2 in turn.
@@ -53,7 +55,11 @@ struct Pinned {
 /// The mask for a group of `threads` threads the title pinned to `mask`:
 /// with `spare` added if they are more than its processors.
 fn widened(mask: usize, threads: usize, spare: usize) -> usize {
-    if threads > mask.count_ones() as usize { mask | spare } else { mask }
+    if threads > mask.count_ones() as usize {
+        mask | spare
+    } else {
+        mask
+    }
 }
 
 /// Whether `mask` is a pinning of the title's: some of the console's
@@ -91,28 +97,44 @@ fn mask_of(thread: HANDLE) -> Option<usize> {
     // SAFETY: plain data filled in by the query.
     let mut affinity: GROUP_AFFINITY = unsafe { std::mem::zeroed() };
     // SAFETY: an open thread handle and a valid out pointer.
-    (unsafe { GetThreadGroupAffinity(thread, &mut affinity) } != 0 && affinity.Group == 0).then_some(affinity.Mask)
+    (unsafe { GetThreadGroupAffinity(thread, &mut affinity) } != 0 && affinity.Group == 0)
+        .then_some(affinity.Mask)
 }
 
 /// One look at all threads: the title's pinned ones are noted, and each
 /// gets its wide mask (`wide`) or the title's own back.
-fn pass(pinned: &mut HashMap<u32, Pinned>, all: usize, spare: usize, wide: bool, said: &mut String) {
+fn pass(
+    pinned: &mut HashMap<u32, Pinned>,
+    all: usize,
+    spare: usize,
+    wide: bool,
+    said: &mut String,
+) {
     let ids = threads();
     pinned.retain(|id, _| ids.contains(id));
     let mut open: Vec<(u32, HANDLE, usize)> = Vec::new();
     for id in ids {
         // SAFETY: a thread id of this process; the handle is closed below.
-        let handle = unsafe { OpenThread(THREAD_QUERY_INFORMATION | THREAD_SET_INFORMATION, 0, id) };
+        let handle =
+            unsafe { OpenThread(THREAD_QUERY_INFORMATION | THREAD_SET_INFORMATION, 0, id) };
         if handle.is_null() {
             continue;
         }
         match mask_of(handle) {
             Some(mask) => {
-                let ours = pinned.get(&id).is_some_and(|p| mask == p.wide || mask == p.original);
+                let ours = pinned
+                    .get(&id)
+                    .is_some_and(|p| mask == p.wide || mask == p.original);
                 if !ours {
                     if console_pinning(mask, all) {
                         // New, or the title pinned it again.
-                        pinned.insert(id, Pinned { original: mask, wide: mask });
+                        pinned.insert(
+                            id,
+                            Pinned {
+                                original: mask,
+                                wide: mask,
+                            },
+                        );
                     } else {
                         // Not pinned (an id used again by another thread).
                         pinned.remove(&id);
@@ -137,7 +159,11 @@ fn pass(pinned: &mut HashMap<u32, Pinned>, all: usize, spare: usize, wide: bool,
         if let Some(p) = pinned.get(&id) {
             let want = if wide { p.wide } else { p.original };
             if mask != want {
-                let affinity = GROUP_AFFINITY { Mask: want, Group: 0, Reserved: [0; 3] };
+                let affinity = GROUP_AFFINITY {
+                    Mask: want,
+                    Group: 0,
+                    Reserved: [0; 3],
+                };
                 // SAFETY: an open thread handle and a mask of this system's processors.
                 if unsafe { SetThreadGroupAffinity(handle, &affinity, std::ptr::null_mut()) } == 0 {
                     tracing::debug!(id, want, error = %std::io::Error::last_os_error(), "a thread's processors could not be set");
@@ -156,7 +182,11 @@ fn pass(pinned: &mut HashMap<u32, Pinned>, all: usize, spare: usize, wide: bool,
             if to == mask {
                 format!("{threads} on {mask:#x} ({} processors)", mask.count_ones())
             } else {
-                format!("{threads} on {mask:#x} ({} processors) -> {to:#x} ({})", mask.count_ones(), to.count_ones())
+                format!(
+                    "{threads} on {mask:#x} ({} processors) -> {to:#x} ({})",
+                    mask.count_ones(),
+                    to.count_ones()
+                )
             }
         })
         .collect::<Vec<_>>()
@@ -240,7 +270,10 @@ mod tests {
         assert!(console_pinning(0x1F00, all));
         assert!(console_pinning(0xFFFF, all));
         assert!(!console_pinning(all, all), "not pinned");
-        assert!(!console_pinning(0x0FFF_1F00, all), "already wide: not the title's");
+        assert!(
+            !console_pinning(0x0FFF_1F00, all),
+            "already wide: not the title's"
+        );
         assert!(!console_pinning(0, all));
         // a PC with sixteen processors: all of them is not a pinning
         assert!(!console_pinning(0xFFFF, 0xFFFF));
@@ -251,7 +284,8 @@ mod tests {
         let ids = threads();
         assert!(!ids.is_empty());
         // SAFETY: a thread id of this process.
-        let handle = unsafe { OpenThread(THREAD_QUERY_INFORMATION | THREAD_SET_INFORMATION, 0, ids[0]) };
+        let handle =
+            unsafe { OpenThread(THREAD_QUERY_INFORMATION | THREAD_SET_INFORMATION, 0, ids[0]) };
         assert!(!handle.is_null());
         assert!(mask_of(handle).is_some_and(|m| m != 0));
         // SAFETY: the handle opened above.

@@ -75,7 +75,13 @@ use windows::core::Interface;
 /// Read once, when the first submission asks.
 pub(crate) fn bits() -> u32 {
     static BITS: OnceLock<u32> = OnceLock::new();
-    *BITS.get_or_init(|| std::env::var("VICTORY_QUEUE2").ok().and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(0) & 3)
+    *BITS.get_or_init(|| {
+        std::env::var("VICTORY_QUEUE2")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(0)
+            & 3
+    })
 }
 
 /// The most bytes of landing buffers in the card's memory, for title
@@ -87,7 +93,11 @@ pub(crate) fn bits() -> u32 {
 fn landing_most() -> u64 {
     static MOST: OnceLock<u64> = OnceLock::new();
     *MOST.get_or_init(|| {
-        std::env::var("VICTORY_QUEUE2_LANDING_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(96) << 20
+        std::env::var("VICTORY_QUEUE2_LANDING_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(96)
+            << 20
     })
 }
 
@@ -170,12 +180,16 @@ impl Lane {
     fn new(device: &ID3D12Device, name: &str) -> windows::core::Result<Lane> {
         // SAFETY: plain object creation with valid descriptions.
         unsafe {
-            let queue: ID3D12CommandQueue = device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
-                Type: D3D12_COMMAND_LIST_TYPE_COPY,
-                ..Default::default()
-            })?;
+            let queue: ID3D12CommandQueue =
+                device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                    Type: D3D12_COMMAND_LIST_TYPE_COPY,
+                    ..Default::default()
+                })?;
             let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
-            let wide: Vec<u16> = format!("victory copy queue ({name})").encode_utf16().chain([0]).collect();
+            let wide: Vec<u16> = format!("victory copy queue ({name})")
+                .encode_utf16()
+                .chain([0])
+                .collect();
             let _ = queue.SetName(windows::core::PCWSTR(wide.as_ptr()));
             Ok(Lane {
                 device: device.clone(),
@@ -195,10 +209,14 @@ impl Lane {
     /// and adds up how long the lane had one ([`LaneStats::busy_us`]).
     fn clocked(&'static self, name: &str) {
         let (tx, rx) = channel();
-        let started = std::thread::Builder::new().name(format!("victory-queue2-{name}")).spawn(move || self.watch(&rx));
+        let started = std::thread::Builder::new()
+            .name(format!("victory-queue2-{name}"))
+            .spawn(move || self.watch(&rx));
         match started {
             Ok(_) => lock(&self.state).clock = Some(tx),
-            Err(e) => tracing::warn!(error = %e, "no thread for a copy queue's clock: its milliseconds stay 0"),
+            Err(e) => {
+                tracing::warn!(error = %e, "no thread for a copy queue's clock: its milliseconds stay 0")
+            }
         }
     }
 
@@ -213,7 +231,9 @@ impl Lane {
                 return;
             }
             let done = Instant::now();
-            self.stats.busy_us.fetch_add(busy_stretch(before, sent, done), Ordering::Relaxed);
+            self.stats
+                .busy_us
+                .fetch_add(busy_stretch(before, sent, done), Ordering::Relaxed);
             before = Some(done);
         }
     }
@@ -227,16 +247,23 @@ impl Lane {
             let done = self.fence.GetCompletedValue();
             let free = {
                 let mut state = lock(&self.state);
-                state.spare.iter().position(|(job, _)| *job <= done).map(|at| state.spare.swap_remove(at).1)
+                state
+                    .spare
+                    .iter()
+                    .position(|(job, _)| *job <= done)
+                    .map(|at| state.spare.swap_remove(at).1)
             };
             if let Some((allocator, list)) = free {
                 allocator.Reset()?;
                 list.Reset(&allocator, None)?;
                 return Ok((allocator, list));
             }
-            let allocator: ID3D12CommandAllocator = self.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY)?;
+            let allocator: ID3D12CommandAllocator = self
+                .device
+                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY)?;
             let list: ID3D12GraphicsCommandList =
-                self.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, &allocator, None)?;
+                self.device
+                    .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, &allocator, None)?;
             Ok((allocator, list))
         }
     }
@@ -247,7 +274,12 @@ impl Lane {
     /// of other queues) has reached its value: every value must have been
     /// signalled on its queue already. Returns the job's number, for
     /// [`Lane::wait`], [`Lane::done`] and [`Second::hold`].
-    pub(crate) fn send(&self, list: CopyList, after: &[(&ID3D12Fence, u64)], bytes: u64) -> windows::core::Result<u64> {
+    pub(crate) fn send(
+        &self,
+        list: CopyList,
+        after: &[(&ID3D12Fence, u64)],
+        bytes: u64,
+    ) -> windows::core::Result<u64> {
         // SAFETY: an open list of ours; the lane's queue and fence; live
         // fences of the same device.
         unsafe {
@@ -356,9 +388,14 @@ impl Second {
         self.down.clocked("down");
         self.up.clocked("up");
         let (tx, rx) = channel();
-        match std::thread::Builder::new().name("victory-queue2-holds".into()).spawn(move || self.watch_holds(&rx)) {
+        match std::thread::Builder::new()
+            .name("victory-queue2-holds".into())
+            .spawn(move || self.watch_holds(&rx))
+        {
             Ok(_) => lock(&self.holds).1 = Some(tx),
-            Err(e) => tracing::warn!(error = %e, "no thread to time the direct queue's waits for the copy queue: they stay 0"),
+            Err(e) => {
+                tracing::warn!(error = %e, "no thread to time the direct queue's waits for the copy queue: they stay 0")
+            }
         }
     }
 
@@ -408,18 +445,31 @@ impl Second {
                 Height: 1,
                 DepthOrArraySize: 1,
                 MipLevels: 1,
-                SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
                 Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
                 ..Default::default()
             };
             let mut buffer: Option<ID3D12Resource> = None;
             // SAFETY: plain creation of a buffer in the card's memory.
             let made = unsafe {
-                self.device.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut buffer)
+                self.device.CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut buffer,
+                )
             };
             match (made, buffer) {
                 (Ok(()), Some(buffer)) => {
-                    let wide: Vec<u16> = "victory landing buffer (title bytes on their way up)".encode_utf16().chain([0]).collect();
+                    let wide: Vec<u16> = "victory landing buffer (title bytes on their way up)"
+                        .encode_utf16()
+                        .chain([0])
+                        .collect();
                     // SAFETY: a live buffer and a terminated string.
                     let _ = unsafe { buffer.SetName(windows::core::PCWSTR(wide.as_ptr())) };
                     landings.push(Landing {
@@ -552,10 +602,18 @@ pub(crate) fn line(frames: f64) {
     let ms = |a: &AtomicU64| take(a) / 1000.0;
     let mb = |a: &AtomicU64| take(a) / (1 << 20) as f64;
     let (down, up) = (&second.down.stats, &second.up.stats);
-    let (down_jobs, down_mb, down_busy, down_waited) = (take(&down.jobs), mb(&down.bytes), ms(&down.busy_us), ms(&down.waited_us));
+    let (down_jobs, down_mb, down_busy, down_waited) = (
+        take(&down.jobs),
+        mb(&down.bytes),
+        ms(&down.busy_us),
+        ms(&down.waited_us),
+    );
     let (up_jobs, up_mb, up_busy) = (take(&up.jobs), mb(&up.bytes), ms(&up.busy_us));
     let [holds, stood, stood_us] = [0, 1, 2].map(|i| take(&second.held[i]));
-    let (landing_mb, no_room) = (second.landing[0].load(Ordering::Relaxed) >> 20, take(&second.landing[1]));
+    let (landing_mb, no_room) = (
+        second.landing[0].load(Ordering::Relaxed) >> 20,
+        take(&second.landing[1]),
+    );
     tracing::info!(
         "the copy queues per frame (VICTORY_QUEUE2={}): fetches of what shaders wrote: {down_jobs:.1} jobs, {down_mb:.1} MB, \
          {down_busy:.1} ms on their queue, our threads stood {down_waited:.1} ms waiting for them; title bytes sent up: \
@@ -649,7 +707,8 @@ void main() {
         fn new(bits: u32) -> Option<Warp> {
             // SAFETY: plain DXGI and D3D12 set-up on the software adapter.
             unsafe {
-                let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+                let factory: IDXGIFactory4 =
+                    CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
                 let adapter: IDXGIAdapter = factory.EnumWarpAdapter().ok()?;
                 let desc = adapter.cast::<IDXGIAdapter1>().ok()?.GetDesc1().ok()?;
                 if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
@@ -668,7 +727,9 @@ void main() {
                 let event = CreateEventW(None, false, false, None).ok()?;
                 // The clocks' threads live as long as the process: the
                 // queues of a test are kept for them.
-                let second: &'static Second = Box::leak(Box::new(Second::new(&device, bits).expect("copy queues on WARP")));
+                let second: &'static Second = Box::leak(Box::new(
+                    Second::new(&device, bits).expect("copy queues on WARP"),
+                ));
                 second.clocked();
                 let mut code: Option<ID3DBlob> = None;
                 D3DCompile(
@@ -686,7 +747,10 @@ void main() {
                 )
                 .expect("the test's shader compiles");
                 let code = code?;
-                let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
+                let bytes = std::slice::from_raw_parts(
+                    code.GetBufferPointer().cast::<u8>(),
+                    code.GetBufferSize(),
+                );
                 let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes).ok()?;
                 let pso: ID3D12PipelineState = device
                     .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
@@ -735,7 +799,10 @@ void main() {
                 Height: 1,
                 DepthOrArraySize: 1,
                 MipLevels: 1,
-                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
                 Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
                 Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
                 ..Default::default()
@@ -745,7 +812,14 @@ void main() {
             // SAFETY: plain creation, and a mapping of CPU-visible memory.
             unsafe {
                 self.device
-                    .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut buffer)
+                    .CreateCommittedResource(
+                        &heap,
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        D3D12_RESOURCE_STATE_COMMON,
+                        None,
+                        &mut buffer,
+                    )
                     .expect("a test buffer");
                 let buffer = buffer.expect("a test buffer");
                 if mapped {
@@ -761,15 +835,22 @@ void main() {
             // SAFETY: plain creation; an open list of ours; our queue and
             // fence.
             unsafe {
-                let allocator: ID3D12CommandAllocator =
-                    self.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("an allocator");
-                let list: ID3D12GraphicsCommandList =
-                    self.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None).expect("a list");
+                let allocator: ID3D12CommandAllocator = self
+                    .device
+                    .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                    .expect("an allocator");
+                let list: ID3D12GraphicsCommandList = self
+                    .device
+                    .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)
+                    .expect("a list");
                 record(&list);
                 list.Close().expect("the list closes");
-                self.direct.ExecuteCommandLists(&[Some(list.cast().expect("a command list"))]);
+                self.direct
+                    .ExecuteCommandLists(&[Some(list.cast().expect("a command list"))]);
                 self.submitted += 1;
-                self.direct.Signal(&self.fence, self.submitted).expect("a signal");
+                self.direct
+                    .Signal(&self.fence, self.submitted)
+                    .expect("a signal");
                 self.flown.push((allocator, list));
             }
             self.submitted
@@ -795,7 +876,9 @@ void main() {
         fn land(&mut self) {
             // SAFETY: our fence and event.
             unsafe {
-                self.fence.SetEventOnCompletion(self.submitted, self.event).expect("a wait");
+                self.fence
+                    .SetEventOnCompletion(self.submitted, self.event)
+                    .expect("a wait");
                 WaitForSingleObject(self.event, INFINITE);
             }
             for lane in [&self.second.down, &self.second.up] {
@@ -814,7 +897,9 @@ void main() {
     /// The dwords of a mapped buffer.
     fn dwords(data: *mut u8, at: usize, n: usize) -> Vec<u32> {
         // SAFETY: the caller's mapping holds them.
-        (0..n).map(|i| unsafe { data.cast::<u32>().add(at + i).read_volatile() }).collect()
+        (0..n)
+            .map(|i| unsafe { data.cast::<u32>().add(at + i).read_volatile() })
+            .collect()
     }
 
     /// What shaders wrote, read back through the down lane, is what the
@@ -835,24 +920,42 @@ void main() {
             // "Shader writes": a few dwords, each by a dispatch.
             let mut behind = 0;
             for i in 0..24u32 {
-                behind = warp.store(&card, (i * 163 % DWORDS as u32) * 4, round * 1000 + i, 20_000);
+                behind = warp.store(
+                    &card,
+                    (i * 163 % DWORDS as u32) * 4,
+                    round * 1000 + i,
+                    20_000,
+                );
             }
             // Through the lane, behind the writes' fence; no wait of ours.
             let second = warp.second;
             let list = second.down.list().expect("a copy list");
             // SAFETY: an open copy list; live buffers.
             unsafe { list.1.CopyBufferRegion(&down_lane, 0, &card, 0, bytes) };
-            let job = second.down.send(list, &[(&warp.fence, behind)], bytes).expect("the fetch is sent");
+            let job = second
+                .down
+                .send(list, &[(&warp.fence, behind)], bytes)
+                .expect("the fetch is sent");
             // And through the direct queue, as before.
             // SAFETY: an open list; live buffers.
             warp.fly(|list| unsafe { list.CopyBufferRegion(&down_direct, 0, &card, 0, bytes) });
-            second.down.wait(job, warp.event).expect("the fetch is waited for");
+            second
+                .down
+                .wait(job, warp.event)
+                .expect("the fetch is waited for");
             assert!(second.down.done(job));
             warp.land();
             let (direct, lane) = (dwords(direct_data, 0, DWORDS), dwords(lane_data, 0, DWORDS));
-            assert_eq!(direct, lane, "round {round}: the two ways brought different bytes");
+            assert_eq!(
+                direct, lane,
+                "round {round}: the two ways brought different bytes"
+            );
             for i in 0..24u32 {
-                assert_eq!(lane[(i * 163 % DWORDS as u32) as usize], round * 1000 + i, "round {round}, write {i}");
+                assert_eq!(
+                    lane[(i * 163 % DWORDS as u32) as usize],
+                    round * 1000 + i,
+                    "round {round}, write {i}"
+                );
             }
         }
         assert_eq!(warp.second.down.stats.jobs.load(Ordering::Relaxed), 3);
@@ -877,17 +980,30 @@ void main() {
             let behind = warp.store(&card, (k * 4) as u32, 0xA000 + k as u32, 60_000);
             let list = second.down.list().expect("a copy list");
             // SAFETY: an open copy list; live buffers; the slot is inside.
-            unsafe { list.1.CopyBufferRegion(&down, k as u64 * bytes, &card, 0, bytes) };
-            second.down.send(list, &[(&warp.fence, behind)], bytes).expect("the fetch is sent");
+            unsafe {
+                list.1
+                    .CopyBufferRegion(&down, k as u64 * bytes, &card, 0, bytes)
+            };
+            second
+                .down
+                .send(list, &[(&warp.fence, behind)], bytes)
+                .expect("the fetch is sent");
         }
         warp.land();
         for k in 0..N {
             let slot = dwords(data, k * N, N);
             for (i, &got) in slot.iter().enumerate().take(k + 1) {
-                assert_eq!(got, 0xA000 + i as u32, "fetch {k} ran before write {i}, which was sent before its fence");
+                assert_eq!(
+                    got,
+                    0xA000 + i as u32,
+                    "fetch {k} ran before write {i}, which was sent before its fence"
+                );
             }
             for (i, &got) in slot.iter().enumerate().skip(k + 1) {
-                assert!(got == 0 || got == 0xA000 + i as u32, "fetch {k} holds {got:#x} for write {i}");
+                assert!(
+                    got == 0 || got == 0xA000 + i as u32,
+                    "fetch {k} holds {got:#x} for write {i}"
+                );
             }
         }
     }
@@ -919,14 +1035,27 @@ void main() {
             for i in 0..(PART as usize / 4) {
                 // SAFETY: inside the mapping; nothing on the card reads
                 // part k before the send below.
-                unsafe { staged.cast::<u32>().add(k * (PART as usize / 4) + i).write_volatile(0xB000 + k as u32) };
+                unsafe {
+                    staged
+                        .cast::<u32>()
+                        .add(k * (PART as usize / 4) + i)
+                        .write_volatile(0xB000 + k as u32)
+                };
             }
             let slow = warp.store(&other, 0, k as u32, 80_000);
             let list = second.up.list().expect("a copy list");
             // SAFETY: an open copy list; live buffers.
-            unsafe { list.1.CopyBufferRegion(&cards[k], 0, &staging, k as u64 * PART, PART) };
-            let job = second.up.send(list, &[(&warp.fence, slow)], PART).expect("the bytes are sent up");
-            second.hold(&warp.direct, job).expect("the direct queue waits");
+            unsafe {
+                list.1
+                    .CopyBufferRegion(&cards[k], 0, &staging, k as u64 * PART, PART)
+            };
+            let job = second
+                .up
+                .send(list, &[(&warp.fence, slow)], PART)
+                .expect("the bytes are sent up");
+            second
+                .hold(&warp.direct, job)
+                .expect("the direct queue waits");
             second.sent_up(&warp.direct, k as u64 + 1);
             // SAFETY: an open list; live buffers; the slots are inside.
             warp.fly(|list| unsafe {
@@ -940,11 +1069,18 @@ void main() {
         for k in 0..N {
             let read = dwords(data, k * N, N);
             for (part, &got) in read.iter().enumerate().take(k + 1) {
-                assert_eq!(got, 0xB000 + part as u32, "the direct queue's read {k} ran before send {part} was on the card");
+                assert_eq!(
+                    got,
+                    0xB000 + part as u32,
+                    "the direct queue's read {k} ran before send {part} was on the card"
+                );
             }
         }
         assert_eq!(second.held[0].load(Ordering::Relaxed), N as u64);
-        assert_eq!(second.up.stats.bytes.load(Ordering::Relaxed), PART * N as u64);
+        assert_eq!(
+            second.up.stats.bytes.load(Ordering::Relaxed),
+            PART * N as u64
+        );
     }
 
     /// The way title bytes go up with bit 2, as `Host::card_before` does
@@ -972,17 +1108,26 @@ void main() {
             let at = (k * 256) as u64;
             // SAFETY: inside the mapping; read by the card only through
             // the job below.
-            unsafe { staged.add(at as usize).cast::<u32>().write_volatile(0xC000 + k as u32) };
+            unsafe {
+                staged
+                    .add(at as usize)
+                    .cast::<u32>()
+                    .write_volatile(0xC000 + k as u32)
+            };
             // A shader's (slow) store to the same dword, sent first.
             warp.store(&card, at as u32, 0xDEAD_0000 + k as u32, 80_000);
             // SAFETY: a plain query.
             let completed = unsafe { warp.fence.GetCompletedValue() };
-            let landing = second.landing(4, completed, warp.submitted + 1).expect("a landing buffer");
+            let landing = second
+                .landing(4, completed, warp.submitted + 1)
+                .expect("a landing buffer");
             let list = second.up.list().expect("a copy list");
             // SAFETY: an open copy list; live buffers.
             unsafe { list.1.CopyBufferRegion(&landing, 0, &staging, at, 4) };
             let job = second.up.send(list, &[], 4).expect("the bytes are sent up");
-            second.hold(&warp.direct, job).expect("the direct queue waits");
+            second
+                .hold(&warp.direct, job)
+                .expect("the direct queue waits");
             // SAFETY: an open list; live buffers.
             let read = warp.fly(|list| unsafe {
                 list.CopyBufferRegion(&card, at, &landing, 0, 4);
@@ -990,14 +1135,28 @@ void main() {
             });
             let list = second.down.list().expect("a copy list");
             // SAFETY: an open copy list; live buffers.
-            unsafe { list.1.CopyBufferRegion(&down_lane, (k * 4) as u64, &card, at, 4) };
-            second.down.send(list, &[(&warp.fence, read)], 4).expect("the fetch is sent");
+            unsafe {
+                list.1
+                    .CopyBufferRegion(&down_lane, (k * 4) as u64, &card, at, 4)
+            };
+            second
+                .down
+                .send(list, &[(&warp.fence, read)], 4)
+                .expect("the fetch is sent");
             landings.push(landing.as_raw() as usize);
         }
         warp.land();
         let want: Vec<u32> = (0..N).map(|k| 0xC000 + k as u32).collect();
-        assert_eq!(dwords(data, 0, N), want, "the title's bytes did not reach the copy behind the shader's store");
-        assert_eq!(dwords(lane_data, 0, N), want, "the copy queue's fetch differs from the direct queue's");
+        assert_eq!(
+            dwords(data, 0, N),
+            want,
+            "the title's bytes did not reach the copy behind the shader's store"
+        );
+        assert_eq!(
+            dwords(lane_data, 0, N),
+            want,
+            "the copy queue's fetch differs from the direct queue's"
+        );
         // No buffer was given out while its last use was in the air: one
         // given to two rounds was free in between.
         landings.sort_unstable();
@@ -1007,7 +1166,9 @@ void main() {
         let alive = second.landing[0].load(Ordering::Relaxed);
         // SAFETY: a plain query.
         let completed = unsafe { warp.fence.GetCompletedValue() };
-        let again = second.landing(4, completed, warp.submitted + 1).expect("a landing buffer");
+        let again = second
+            .landing(4, completed, warp.submitted + 1)
+            .expect("a landing buffer");
         assert!(landings.contains(&(again.as_raw() as usize)));
         assert_eq!(second.landing[0].load(Ordering::Relaxed), alive);
     }
@@ -1029,18 +1190,28 @@ void main() {
         let first_list = first.1.as_raw();
         // SAFETY: an open copy list; live buffers.
         unsafe { first.1.CopyBufferRegion(&down, 0, &card, 0, 64) };
-        let job = second.down.send(first, &[(&warp.fence, behind)], 64).expect("sent");
+        let job = second
+            .down
+            .send(first, &[(&warp.fence, behind)], 64)
+            .expect("sent");
         if !second.down.done(job) {
             // Still in the air: the next list is another one.
             let next = second.down.list().expect("a copy list");
-            assert_ne!(next.1.as_raw(), first_list, "a list was reset while its job had not run");
+            assert_ne!(
+                next.1.as_raw(),
+                first_list,
+                "a list was reset while its job had not run"
+            );
             second.down.send(next, &[], 0).expect("sent");
         }
         warp.land();
         // Everything has run: a list of before comes back.
         let again = second.down.list().expect("a copy list");
         let spare_left = lock(&second.down.state).spare.len();
-        assert!(spare_left <= 1, "lists that have run are taken before new ones are made");
+        assert!(
+            spare_left <= 1,
+            "lists that have run are taken before new ones are made"
+        );
         second.down.send(again, &[], 0).expect("sent");
         warp.land();
     }
