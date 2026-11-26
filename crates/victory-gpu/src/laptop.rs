@@ -153,6 +153,18 @@ pub(crate) fn texture_heaps_on(raw: Option<&str>, profile_on: bool) -> bool {
     }
 }
 
+/// `VICTORY_UI_PLANE`: `0` leaves the title's interface plane out,
+/// `straight` blends it by straight alpha, and anything else (including
+/// unset) uses premultiplied alpha, which is how the console composites
+/// that plane over the picture. `0` off, `1` premultiplied, `2` straight.
+pub(crate) fn ui_plane_mode(raw: Option<&str>) -> u8 {
+    match raw.map(str::trim) {
+        Some("0") => 0,
+        Some("straight") => 2,
+        _ => 1,
+    }
+}
+
 /// Bytes in one shared texture heap (`VICTORY_TEXTURE_HEAP_MB`, default 64,
 /// clamped to 32..=256). 256 MiB is what a 16 GB card used; an 8 GB card
 /// keeps a smaller heap so an empty tail is not a large part of its budget.
@@ -406,6 +418,15 @@ mod tests {
         assert_eq!(ambient_level(Some("0.25")), Some(0.25));
         assert_eq!(ambient_level(Some("0.6")), Some(0.6));
         assert_eq!(ambient_level(Some("4")), Some(1.0));
+    }
+
+    #[test]
+    fn the_interface_plane_is_premultiplied_unless_told() {
+        assert_eq!(ui_plane_mode(None), 1);
+        assert_eq!(ui_plane_mode(Some("")), 1);
+        assert_eq!(ui_plane_mode(Some("1")), 1);
+        assert_eq!(ui_plane_mode(Some("0")), 0);
+        assert_eq!(ui_plane_mode(Some("straight")), 2);
     }
 
     #[test]

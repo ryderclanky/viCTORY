@@ -81,12 +81,29 @@ mod tests {
     fn series_s_is_the_16_gb_consoles_memory() {
         let (gpu, standard) = Console::SeriesS.title_memory();
         assert_eq!(gpu, 0);
+        assert_eq!(standard, 7_776 << 20);
         assert!(standard < 8 << 30, "Series S title memory fits under 8 GiB");
         let (gpu, standard) = Console::SeriesX.title_memory();
         assert!(
             gpu + standard > 12 << 30,
             "Series X title memory is what overflowed a 16 GB machine"
         );
+    }
+
+    #[test]
+    fn series_s_leaves_a_16_gb_laptop_room_the_layer_can_use() {
+        let title = |c: Console| {
+            let (gpu, standard) = c.title_memory();
+            gpu + standard
+        };
+        let series_s = title(Console::SeriesS);
+        let series_x = title(Console::SeriesX);
+        // 16 GB of RAM. Series S's own limit is under 8 GiB, so the layer's
+        // copies have the rest of the machine. Series X's limit is most of it
+        // (the 21.5 GB private peak on that laptop).
+        assert!((16 << 30) - series_s > 8 << 30);
+        assert!(series_x > series_s + (4 << 30));
+        assert!(series_s < 14 << 30);
     }
 
     #[test]

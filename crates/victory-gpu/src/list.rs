@@ -811,6 +811,54 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
     0
 }
 
+/// The title's upscale of `colour` into `output`, drawn into the title's
+/// list `this`: `render` texels of the input over `size` texels of the
+/// output. What the title had set on the list is set again after it.
+/// False if nothing was recorded.
+#[cfg(windows)]
+pub(crate) fn upscale(
+    this: This,
+    colour: This,
+    output: This,
+    render: [u32; 2],
+    size: [u32; 2],
+) -> bool {
+    const RENDER_TARGET: u32 = 0x4;
+    const PIXEL_READ: u32 = 0x80;
+    // Pointers of the title's: aligned heap addresses.
+    if [this as usize, colour as usize, output as usize]
+        .iter()
+        .any(|&p| p < 0x1_0000 || p % 8 != 0)
+    {
+        return false;
+    }
+    let Some(list) = host_list(this) else {
+        return false;
+    };
+    let (Some(to), Some(from)) = (
+        crate::resource::host_resource(output),
+        crate::resource::host_resource(colour),
+    ) else {
+        return false;
+    };
+    ensure_state(list, output, RENDER_TARGET);
+    ensure_state(list, colour, PIXEL_READ);
+    crate::texture::host_written(output);
+    #[cfg(feature = "diagnostics")]
+    list.note_op(|| {
+        format!("draw 3x1 [upscale of ours] {colour:?} {render:?} over {output:?} {size:?}")
+    });
+    if !crate::upscale::record_upscale(list, from, to, render, size) {
+        return false;
+    }
+    // SAFETY: the title passes one of its lists. A list is recorded by one
+    // thread at a time and is not submitted while it records. The host list
+    // and the draw state are different fields.
+    let state = unsafe { &(*this.cast::<List>()).state };
+    state.lock().unwrap_or_else(|e| e.into_inner()).replay(list);
+    true
+}
+
 /// Moves a title texture's host copy to `state` in the list, if needed.
 #[cfg(windows)]
 pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: u32) {

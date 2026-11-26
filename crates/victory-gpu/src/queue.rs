@@ -60,10 +60,12 @@ enum Held {
     Running,
     /// With [`present_behind`]: the title's present of a frame, due after
     /// what the queue holds before it: the host texture shown, the state
-    /// the title's lists leave it in, and the frame's number.
+    /// the title's lists leave it in, the interface plane and the state it
+    /// is left in (when the title presents one), and the frame's number.
     Present(
         windows::Win32::Graphics::Direct3D12::ID3D12Resource,
         u32,
+        Option<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32)>,
         u64,
     ),
 }
@@ -170,13 +172,21 @@ fn send_behind(this: This, planes: u32, plane_parameters: *const Plane) -> bool 
     // The state the lists recorded so far leave the texture in: what our
     // copy finds it in when it runs behind them (looked at, not changed).
     const COPY_SOURCE: u32 = 0x800;
+    const PIXEL_READ: u32 = 0x80;
     let state = crate::resource::host_transition(resource, COPY_SOURCE)
         .map_or(COPY_SOURCE, |(_, before)| before);
     crate::resource::host_transition(resource, state);
     let texture = texture.clone();
+    let overlay = interface_plane(planes, plane_parameters).and_then(|plane| {
+        let texture = crate::resource::host_resource(plane)?.clone();
+        let state = crate::resource::host_transition(plane, PIXEL_READ)
+            .map_or(PIXEL_READ, |(_, before)| before);
+        crate::resource::host_transition(plane, state);
+        Some((texture, state))
+    });
     let sent = hold(this, || {
         PRESENTS_HELD.fetch_add(1, Ordering::Relaxed);
-        Held::Present(texture, state, frame)
+        Held::Present(texture, state, overlay, frame)
     });
     if sent {
         PRESENTS_BEHIND.fetch_add(1, Ordering::Relaxed);
@@ -967,10 +977,15 @@ fn release_held_now(all: bool) {
                             }
                         }
                     }
-                    Held::Present(texture, state, frame) => {
+                    Held::Present(texture, state, overlay, frame) => {
                         let show = || {
                             if let Some(host) = crate::host::host() {
-                                let _ = host.present(&texture, state, frame);
+                                let _ = host.present(
+                                    &texture,
+                                    state,
+                                    overlay.as_ref().map(|(plane, state)| (plane, *state)),
+                                    frame,
+                                );
                             }
                         };
                         if all {
@@ -1194,12 +1209,45 @@ fn execute_now(this: This, count: u32, lists: *const This) {
     }
 }
 
-/// The start of a present plane: frame token, then the plane's resources.
+/// A present plane: frame token, the plane's resources, its source and
+/// destination rectangles, then its colour space and flags. 72 bytes: the
+/// title's array of two planes (the picture, then its interface) puts the
+/// second at +0x48.
 #[repr(C)]
 pub(crate) struct Plane {
     token: u64,
     count: u32,
     resources: *const This,
+    _source: *const u8,
+    _destination: *const u8,
+    _rest: [u64; 4],
+}
+const _: () = assert!(size_of::<Plane>() == 0x48);
+
+/// The title's interface plane, when this present has one and it is drawn
+/// (`VICTORY_UI_PLANE`).
+#[cfg(windows)]
+fn interface_plane(planes: u32, plane_parameters: *const Plane) -> Option<This> {
+    if planes < 2 || plane_parameters.is_null() || !crate::upscale::ui_plane_on() {
+        return None;
+    }
+    // SAFETY: the title passes `planes` descriptions, each 0x48 bytes.
+    let (picture, second) = unsafe {
+        let first = &*plane_parameters;
+        let second = &*plane_parameters.add(1);
+        let picture = if first.count > 0 && !first.resources.is_null() {
+            *first.resources as usize
+        } else {
+            0
+        };
+        let resource = if second.resources.is_null() {
+            0
+        } else {
+            *second.resources as usize
+        };
+        (picture, (second.count, resource))
+    };
+    crate::upscale::keep_interface(true, picture, Some(second)).map(|resource| resource as This)
 }
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
@@ -1503,10 +1551,25 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
         && let Some(host) = crate::host::host()
     {
         const COPY_SOURCE: u32 = 0x800;
+        const PIXEL_READ: u32 = 0x80;
+        let overlay = interface_plane(planes, plane_parameters).and_then(|plane| {
+            let texture = crate::resource::host_resource(plane)?;
+            let state = crate::resource::host_transition(plane, PIXEL_READ)
+                .map_or(PIXEL_READ, |(_, before)| before);
+            Some((texture, state, plane))
+        });
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
-        let shown = host.present(texture, state, frame);
+        let shown = host.present(
+            texture,
+            state,
+            overlay.as_ref().map(|(plane, state, _)| (*plane, *state)),
+            frame,
+        );
         crate::resource::host_transition(resource, state);
+        if let Some((_, state, plane)) = overlay {
+            crate::resource::host_transition(plane, state);
+        }
         #[cfg(feature = "diagnostics")]
         blinks(frame, resource, state, shown);
         #[cfg(not(feature = "diagnostics"))]

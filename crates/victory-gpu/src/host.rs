@@ -11377,11 +11377,20 @@ impl Meter {
 
 impl Host {
     /// Shows `texture`, which is in `state` (a host state) and stays in it,
-    /// as frame `frame` (saved if captures are on). `None` if nothing was
-    /// shown; else, in diagnostics builds, whether the frame was black.
-    pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+    /// as frame `frame` (saved if captures are on). `overlay`, when the
+    /// title presents one, is its interface plane and the state that plane
+    /// is in; it is drawn over the picture and left in that state. `None`
+    /// if nothing was shown; else, in diagnostics builds, whether the frame
+    /// was black.
+    pub(crate) fn present(
+        &self,
+        texture: &ID3D12Resource,
+        state: u32,
+        overlay: Option<(&ID3D12Resource, u32)>,
+        frame: u64,
+    ) -> Option<bool> {
         let showing = std::time::Instant::now();
-        let shown = self.present_now(texture, state, frame);
+        let shown = self.present_now(texture, state, overlay, frame);
         crate::framelog::add(
             crate::framelog::T::PresentShowUs,
             showing.elapsed().as_micros() as u64,
@@ -11389,7 +11398,13 @@ impl Host {
         shown
     }
 
-    fn present_now(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+    fn present_now(
+        &self,
+        texture: &ID3D12Resource,
+        state: u32,
+        overlay: Option<(&ID3D12Resource, u32)>,
+        frame: u64,
+    ) -> Option<bool> {
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {
@@ -11477,6 +11492,37 @@ impl Host {
                 ),
             ]);
             list.CopyResource(&back, texture);
+            // The title's interface plane over the picture. The frame rate
+            // below is copied in while the back buffer is a copy destination,
+            // so the plane is drawn first and the buffer put back.
+            if let Some((plane, plane_state)) = overlay {
+                const PIXEL_READ: u32 = 0x80;
+                list.ResourceBarrier(&[
+                    transition(
+                        plane,
+                        D3D12_RESOURCE_STATES(plane_state as i32),
+                        D3D12_RESOURCE_STATES(PIXEL_READ as i32),
+                    ),
+                    transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    ),
+                ]);
+                crate::upscale::record_overlay(list, plane, &back, format, width, height);
+                list.ResourceBarrier(&[
+                    transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_RENDER_TARGET,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                    ),
+                    transition(
+                        plane,
+                        D3D12_RESOURCE_STATES(PIXEL_READ as i32),
+                        D3D12_RESOURCE_STATES(plane_state as i32),
+                    ),
+                ]);
+            }
             // The frame rate, into the corner of what is shown (not of the
             // title's own frame, which the lines below read back).
             crate::fpsbox::draw(self, list, &back, (width, height, format));
