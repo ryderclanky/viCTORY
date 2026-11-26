@@ -90,10 +90,14 @@ still forces the larger console.
 | `VICTORY_TEXTURE_HEAPS` | on for the small profile, off otherwise | Place those textures in shared 64 MiB heaps instead of one committed resource each, so the driver holds fewer private allocations. A range is reused only after the card has finished with it. |
 | `VICTORY_TEXTURE_HEAP_MB` | `64` (32 to 256) | Size of one shared heap. 256 was measured on a 16 GB card; 64 leaves room on an 8 GB card. |
 | `VICTORY_AMBIENT` | off | After the screen-probe resolve, replace its indirect light with a constant in `0.0..=1.0` so shadowed geometry is visible while ray tracing stays off. `0.25` is the laptop preset; `0.6` is brighter and can glow in fog. |
-| `VICTORY_CONSOLE` | Series X | `series-s` gives the title the smaller console's memory (under 8 GiB) and device type. |
+| `VICTORY_CONSOLE` | Series X | `series-s` gives the title the smaller console: device type, under 8 GiB of title memory (7,776 MiB), a 1280x720 render and a 1920x1080 present. The presented frame is the rendered colour drawn over the upscaler's output, because that upscaler's own passes do not translate. |
 | `VICTORY_INPLACE` | `0` | Stays off. Reading title memory in place was slower. |
 | `VICTORY_CARD_FETCH_INFLIGHT` | `0` | Stays off. It cut copy-back waits and made the card much busier. |
 | `VICTORY_BVH_BUILDER` | off | Ray tracing stays off. The ambient floor is the stand-in for the missing bounce light. |
+| `VICTORY_UPSCALE` | stand-in | `title` leaves Series S upscaling to the title's own passes, which do not translate, so the picture stays black. |
+| `VICTORY_UI_PLANE` | premultiplied | `0` leaves the title's interface plane out of the presented frame. `straight` blends it by straight alpha. |
+
+Series S is the memory cut on a 16 GB machine. Its title limit is 7,776 MiB, against about 13.5 GiB on Series X, and it draws a 720p picture into a 1080p present instead of a 1440p picture into a 4K one. The 21.5 GB private / 7.8 GB VRAM peak was the Series X profile with the switches above. A tighter texture cap than the small profile's is not applied: when the card was held under that cap, surfaces the title fills went untextured.
 
 ## Status of this fork (2026-11-26, 11:50 UTC)
 

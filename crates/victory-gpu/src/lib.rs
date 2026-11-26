@@ -92,6 +92,7 @@ mod texture;
 #[cfg(windows)]
 mod tiles;
 mod tuning;
+pub mod upscale;
 #[cfg(windows)]
 mod watch;
 

@@ -153,6 +153,25 @@ pub extern "system" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *
         module
     };
     let Some(m) = registry().iter().find(|m| handle(m) == module) else {
+        // The title's upscaler: its dispatch goes through the GPU side,
+        // which draws the colour input over the output. The upscaler's own
+        // passes do not translate, so without this the presented frame stays
+        // black on the smaller console.
+        if (name as usize) >= 0x1_0000 {
+            let export = narrow(name);
+            if export == "ffxDispatch"
+                && let Some(path) = runtime::image_path(module as usize)
+            {
+                let path = path.to_string_lossy();
+                let env = std::env::var("VICTORY_UPSCALE").ok();
+                if victory_gpu::upscale::stands_in(&export, &path, env.as_deref()) {
+                    let original = host::get_proc_address(module, name);
+                    if !original.is_null() {
+                        return victory_gpu::upscale::hook(original as usize) as *mut c_void;
+                    }
+                }
+            }
+        }
         return host_override(module, name).unwrap_or_else(|| host::get_proc_address(module, name));
     };
     // Values below 0x10000 are ordinals; we export by name only.
@@ -595,6 +614,18 @@ mod host {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_series_s_upscaler_is_the_dispatch_we_stand_in_for() {
+        let dll = r"C:\title\amd_fidelityfx_upscaler_xbox.dll";
+        assert!(victory_gpu::upscale::stands_in("ffxDispatch", dll, None));
+        assert!(!victory_gpu::upscale::stands_in(
+            "ffxDispatch",
+            dll,
+            Some("title")
+        ));
+        assert!(!victory_gpu::upscale::stands_in("CreateDevice", dll, None));
+    }
 
     #[test]
     fn title_images_report_their_original_path() {
