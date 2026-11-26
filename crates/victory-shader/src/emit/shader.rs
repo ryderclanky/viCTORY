@@ -82,7 +82,7 @@ pub const GLOBALLY_COHERENT: u32 = 0x4000;
 /// comes from a UAV barrier. Off by default: the flag asks the driver for
 /// ordering on every access through that view, and that costs wherever it is
 /// not needed.
-fn coherent_mem_on() -> bool {
+pub(super) fn coherent_mem_on() -> bool {
     #[cfg(test)]
     if let Some(on) = TEST_COHERENT_MEM.get() {
         return on;
