@@ -1531,9 +1531,9 @@ fn pooled(n: usize) -> Vec<u8> {
 }
 
 /// Returns a snapshot buffer to the pool: at most 8 kept, the largest, and
-/// of those the largest one and the next ones up to `KEPT` bytes in all.
+/// of those the largest one and the next ones up to [`snapshot_kept`] bytes.
 fn give_back(v: Vec<u8>) {
-    const KEPT: usize = 512 << 20;
+    let kept_most = crate::laptop::snapshot_pool_bytes(crate::tuning::tight_ram());
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.push(v);
     pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
@@ -1542,7 +1542,7 @@ fn give_back(v: Vec<u8>) {
     pool.retain(|v| {
         seen += 1;
         total = total.saturating_add(v.capacity());
-        seen == 1 || total <= KEPT
+        seen == 1 || total <= kept_most
     });
 }
 
@@ -5261,29 +5261,35 @@ fn lookup_tables(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
 /// [`window`] cuts the windows of asks that give a length on a finer grid.
 const WINDOW: u64 = 4 << 20;
 
-/// The grid the windows of asks with a length are cut on, in bytes: 4 MiB
-/// unless `VICTORY_WINDOW_KB` names a smaller power of two (64 at least).
-/// A window is the PC's memory, all of it, however little of it is read:
-/// 803 windows held 3.3 GB in run 60's gameplay, and all that was ever
-/// asked for in them lay within 1.6 GB. On a grid of 1 MiB or 256 KiB a
-/// window ends nearer to what is read. An ask without a length keeps the
-/// 4 MiB grid whatever is set: a root view reads from its address to its
-/// window's end, and mesh streams bound that way reach megabytes.
-/// shortcut: the default stays 4 MiB until a run with the memory line's
-/// window counts has shown what the finer grids give; the same memory
-/// asked for with different ranges then lies in more than one window.
+/// The grid the windows of asks with a length are cut on, in bytes.
+/// [`crate::laptop::window_grid_bytes`]: 4 MiB, or 1 MiB on a tight machine,
+/// unless `VICTORY_WINDOW_KB` names a power of two from 64 KiB to 4 MiB.
+/// A window is the PC's memory, all of it, however little of it is read.
+/// An ask without a length keeps the 4 MiB grid whatever is set: a root
+/// view reads from its address to its window's end, and mesh streams bound
+/// that way reach megabytes. The same memory asked for on two cells then
+/// lies in more than one window; `VICTORY_WINDOW_KB=4096` is the old grid.
 fn window() -> u64 {
     static GRID: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *GRID.get_or_init(|| {
-        let kb = std::env::var("VICTORY_WINDOW_KB")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok());
-        grid(kb)
+        let bytes = crate::laptop::window_grid_bytes(
+            std::env::var("VICTORY_WINDOW_KB").ok().as_deref(),
+            crate::tuning::tight_ram(),
+        );
+        if bytes != WINDOW {
+            tracing::info!(
+                kib = bytes >> 10,
+                "windows of asks that give a length are cut on this grid (VICTORY_WINDOW_KB=4096 keeps 4 MiB)"
+            );
+        }
+        bytes
     })
 }
 
 /// The window grid in bytes for a setting in KiB: a power of two from
-/// 64 KiB to 4 MiB, 4 MiB for anything else.
+/// 64 KiB to 4 MiB, 4 MiB for anything else. The run-time grid is
+/// [`crate::laptop::window_grid_bytes`]; this is the same rule for the tests.
+#[cfg(test)]
 fn grid(kb: Option<u64>) -> u64 {
     match kb {
         Some(kb) if kb.is_power_of_two() && (64..=4096).contains(&kb) => kb << 10,
@@ -5307,16 +5313,28 @@ fn window_of(address: u64, end: u64, grid: u64) -> (u64, u64) {
 /// window is the cell's tail from the ask's step on ([`TAIL_STEP`]); an ask
 /// lower in the cell later makes a longer tail, which every ask from then
 /// on takes, and the shorter one goes when nothing holds it any more.
-/// shortcut: off unless `VICTORY_WINDOW_TAILS=1`. A longer tail is another
-/// host buffer than the shorter one: what was bound to the shorter stays
-/// right only because every list brings up to date the copy it bound
-/// (`draw.rs` keeps a root view's copy with its slot). It pays only
-/// together with `VICTORY_WINDOW_KB` below 4096: on the 4 MiB grid an ask
-/// with a length in the same cell makes the whole cell's window, and the
-/// tail is that.
+/// On when [`crate::laptop::window_tails_on`] says so (a tight machine, or
+/// `VICTORY_WINDOW_TAILS=1`). A longer tail is another host buffer than the
+/// shorter one: what was bound to the shorter stays right only because every
+/// list brings up to date the copy it bound (`draw.rs` keeps a root view's
+/// copy with its slot). On the 4 MiB grid an ask with a length in the same
+/// cell makes the whole cell's window, and the tail is that as well until
+/// nothing holds it; the 1 MiB grid is what makes the tail the copy that
+/// stays.
 fn tails() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WINDOW_TAILS").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| {
+        let on = crate::laptop::window_tails_on(
+            std::env::var("VICTORY_WINDOW_TAILS").ok().as_deref(),
+            crate::tuning::tight_ram(),
+        );
+        if on {
+            tracing::info!(
+                "unsized window asks keep the tail of their 4 MiB cell (VICTORY_WINDOW_TAILS=0 keeps the whole cell)"
+            );
+        }
+        on
+    })
 }
 
 /// Tails begin on multiples of this. A longer tail is a new host buffer,

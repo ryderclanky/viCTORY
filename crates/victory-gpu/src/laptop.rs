@@ -165,6 +165,71 @@ pub(crate) fn ui_plane_mode(raw: Option<&str>) -> u8 {
     }
 }
 
+/// Whether host copies of title memory share heaps (`VICTORY_BUFFER_HEAPS`).
+/// `1` / `on` forces them, `0` / `off` keeps one committed buffer each, and
+/// anything else follows the tight-RAM profile. Each committed write-back
+/// buffer is its own driver allocation; a 16 GB machine holds thousands of
+/// them (windows and the small title buffers).
+pub(crate) fn buffer_heaps_on(raw: Option<&str>, tight: bool) -> bool {
+    match raw.map(str::trim) {
+        Some("1" | "on") => true,
+        Some("0" | "off") => false,
+        _ => tight,
+    }
+}
+
+/// A shared buffer of `size` bytes is cut from a heap when this is `Some`.
+/// Under 64 KiB stays committed: a placed buffer is aligned to 64 KiB, so a
+/// 256-byte one would reserve a whole page of the heap. Over 16 MiB stays
+/// committed so one copy cannot pin a heap.
+pub(crate) fn buffer_heap_len(size: u64) -> Option<u64> {
+    const PLAIN: u64 = 64 << 10;
+    const MOST: u64 = 16 << 20;
+    ((PLAIN..=MOST).contains(&size) && size.is_multiple_of(PLAIN)).then_some(size)
+}
+
+/// The grid, in bytes, windows of asks that give a length are cut on.
+/// Unset on a tight machine is 1 MiB. `VICTORY_WINDOW_KB` is a power of two
+/// from 64 KiB to 4 MiB; anything else is the 4 MiB grid.
+///
+/// Run 60's gameplay held 803 windows, 3.3 GB, and everything ever asked for
+/// in them lay within 1.6 GB: a 4 MiB window commits the whole cell however
+/// little of it a draw reads. 1 MiB ends the window nearer to the ask. 256
+/// KiB was measured the other way (more windows made and let go, more bytes
+/// copied) and is not the default. An ask with no length keeps the 4 MiB
+/// cell; [`window_tails_on`] drops the part of that cell below the ask.
+pub(crate) fn window_grid_bytes(raw: Option<&str>, tight: bool) -> u64 {
+    const WINDOW: u64 = 4 << 20;
+    let Some(raw) = raw.map(str::trim) else {
+        return if tight { 1 << 20 } else { WINDOW };
+    };
+    match raw.parse::<u64>().ok() {
+        Some(kb) if kb.is_power_of_two() && (64..=4096).contains(&kb) => kb << 10,
+        // Set, but not a grid we cut on: the 4 MiB cells, tight machine or not.
+        _ => WINDOW,
+    }
+}
+
+/// Whether an ask with no length keeps only the tail of its 4 MiB cell
+/// (`VICTORY_WINDOW_TAILS`). Unset on a tight machine is on: the bytes below
+/// the lowest address asked for in the cell are never read (run 65: 513 of
+/// 782 windows, 2,052 MB, were such asks). `0` / `off` keeps the whole cell.
+pub(crate) fn window_tails_on(raw: Option<&str>, tight: bool) -> bool {
+    match raw.map(str::trim) {
+        Some("1" | "on") => true,
+        Some("0" | "off") => false,
+        _ => tight,
+    }
+}
+
+/// Snapshot buffers kept for reuse, in bytes. The pool holds at most eight,
+/// and on a tight machine at most 128 MiB of them (512 otherwise): a small
+/// copy used to be handed the 174 MB buffer kept for the big heap, and the
+/// pool then grew to 1.4 GB.
+pub(crate) fn snapshot_pool_bytes(tight: bool) -> usize {
+    if tight { 128 << 20 } else { 512 << 20 }
+}
+
 /// Bytes in one shared texture heap (`VICTORY_TEXTURE_HEAP_MB`, default 64,
 /// clamped to 32..=256). 256 MiB is what a 16 GB card used; an 8 GB card
 /// keeps a smaller heap so an empty tail is not a large part of its budget.
@@ -440,6 +505,38 @@ mod tests {
         assert_eq!(texture_heap_bytes(Some("256")), 256 << 20);
         assert_eq!(texture_heap_bytes(Some("8")), 32 << 20);
         assert_eq!(texture_heap_bytes(Some("9999")), 256 << 20);
+    }
+
+    #[test]
+    fn a_tight_machine_shares_buffer_heaps_and_cuts_windows_nearer_the_ask() {
+        assert!(!buffer_heaps_on(None, false));
+        assert!(buffer_heaps_on(None, true));
+        assert!(!buffer_heaps_on(Some("0"), true));
+        assert!(!buffer_heaps_on(Some("off"), true));
+        assert!(buffer_heaps_on(Some("1"), false));
+        assert!(buffer_heaps_on(Some("on"), false));
+
+        assert_eq!(buffer_heap_len(256), None);
+        assert_eq!(buffer_heap_len((64 << 10) - 1), None);
+        assert_eq!(buffer_heap_len(64 << 10), Some(64 << 10));
+        assert_eq!(buffer_heap_len(1 << 20), Some(1 << 20));
+        assert_eq!(buffer_heap_len(16 << 20), Some(16 << 20));
+        assert_eq!(buffer_heap_len((16 << 20) + (64 << 10)), None);
+        assert_eq!(buffer_heap_len((1 << 20) + 256), None);
+
+        assert_eq!(window_grid_bytes(None, false), 4 << 20);
+        assert_eq!(window_grid_bytes(None, true), 1 << 20);
+        assert_eq!(window_grid_bytes(Some("4096"), true), 4 << 20);
+        assert_eq!(window_grid_bytes(Some("256"), false), 256 << 10);
+        assert_eq!(window_grid_bytes(Some("nope"), true), 4 << 20);
+
+        assert!(!window_tails_on(None, false));
+        assert!(window_tails_on(None, true));
+        assert!(!window_tails_on(Some("0"), true));
+        assert!(window_tails_on(Some("1"), false));
+
+        assert_eq!(snapshot_pool_bytes(false), 512 << 20);
+        assert_eq!(snapshot_pool_bytes(true), 128 << 20);
     }
 
     #[test]

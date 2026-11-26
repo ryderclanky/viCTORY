@@ -65,8 +65,12 @@ and a machine whose budget cannot be read gets the shipped defaults unchanged.
 A laptop with 16 GB of system RAM and an 8 GB NVIDIA card (Acer Nitro, i7-13620H,
 RTX 5060 Laptop) was running out of memory in the intro: about 18-20 GiB of private
 bytes and a few hundred megabytes of RAM free. Series X title memory alone is about
-13.5 GiB. The switches below are off unless set, except shared texture heaps, which
-follow the small-machine profile (`VICTORY_TEXTURE_HEAPS=0` turns them off).
+13.5 GiB. On Series S the same laptop's prison-cell gameplay was about 4 fps
+(255 ms a frame, about 4,600 draws) with a private peak of 17.3 GB, just over
+16 GB, so Windows still paged. The switches below are off unless set, except
+the ones the small-machine profile turns on (shared texture heaps, shared
+buffer heaps, 1 MiB windows, window tails). `play.ps1` also turns on the fast
+paths that cut redundant per-frame copies.
 
 ```
 set VICTORY_CONSOLE=series-s
@@ -74,8 +78,18 @@ set VICTORY_PROFILE=small
 set VICTORY_TEXTURE_DROP_MIPS=2
 set VICTORY_TEXTURE_HEAPS=1
 set VICTORY_TEXTURE_HEAP_MB=64
+set VICTORY_BUFFER_HEAPS=1
+set VICTORY_WINDOW_KB=1024
+set VICTORY_WINDOW_TAILS=1
 set VICTORY_AMBIENT=0.25
 set VICTORY_TEXTURE_BACK=1
+set VICTORY_HEAP_WORKER=1
+set VICTORY_LIGHT_REFRESH=1
+set VICTORY_JOIN_COPIES=1
+set VICTORY_DIRTY_4K=1
+set VICTORY_LOOKUP_CACHE=1
+set VICTORY_CARD_REHASH_RUNS=1
+set VICTORY_WIDE_MERGE=1
 set VICTORY_INPLACE=0
 set VICTORY_CARD_FETCH_INFLIGHT=0
 victory run <game dir>\<the title's exe> --execute
@@ -97,6 +111,17 @@ still forces the larger console.
 | `VICTORY_TEXTURE_DROP_MIPS` | `0` | Leave out this many largest levels of big 2D textures the title fills (1 or 2; at most 4). Views and copies shift so the texels that remain stay bound. Textures under 512 texels, short splash chains, render targets and the ocean maps `VICTORY_TEXTURE_BACK` copies are left whole. |
 | `VICTORY_TEXTURE_HEAPS` | on for the small profile, off otherwise | Place those textures in shared 64 MiB heaps instead of one committed resource each, so the driver holds fewer private allocations. A range is reused only after the card has finished with it. |
 | `VICTORY_TEXTURE_HEAP_MB` | `64` (32 to 256) | Size of one shared heap. 256 was measured on a 16 GB card; 64 leaves room on an 8 GB card. |
+| `VICTORY_BUFFER_HEAPS` | on for the small profile, off otherwise | Place host copies of title memory (64 KiB to 16 MiB) in shared 64 MiB write-back heaps instead of one committed buffer each. `0` keeps a committed buffer each. |
+| `VICTORY_WINDOW_KB` | `1024` on the small profile, `4096` otherwise | Grid of the windows outside title buffers, for asks that give a length. 4 MiB committed the whole cell (3.3 GB of windows, 1.6 GB ever asked for). 256 was slower. `4096` is the old grid. |
+| `VICTORY_WINDOW_TAILS` | on for the small profile, off otherwise | An ask with no length keeps the tail of its 4 MiB cell, from the ask to the end of the cell, instead of the whole cell. `0` keeps the whole cell. |
+| `VICTORY_HEAP_WORKER` | off; `play.ps1` sets `1` | Textures picked by index upload on their own thread. Measured about +40% world frames at the boat. Needs the relay, which is on unless `VICTORY_RELAY=0`. |
+| `VICTORY_LIGHT_REFRESH` | off; `play.ps1` sets `1` | A refresh of view memory that nothing wrote is answered from the journal, not the guards' lock. Measured 23 ms a frame of the submitting thread indoors and 45 ms outdoors. The bytes copied do not change. |
+| `VICTORY_JOIN_COPIES` | off; `play.ps1` sets `1` | Title buffer copies that continue the one before them become one kernel copy. The bytes are the same; a missing page fails the joined copy and then goes page by page, as a single copy does. |
+| `VICTORY_DIRTY_4K` | off; `play.ps1` sets `1` | A write-watched 64 KiB page is copied as the 4 KiB pages the kernel found written, when the copy already holds the rest. |
+| `VICTORY_LOOKUP_CACHE` | off; `play.ps1` sets `1` | A recording thread remembers which host copy an ask found until the buffer tables change. The six recording threads spent about 54 ms a frame together on that lock. |
+| `VICTORY_CARD_REHASH_RUNS` | off; `play.ps1` sets `1` | Pieces of a card copy that touch are hashed in one pass instead of one pass per range sent up. A piece hashed when it need not be costs a fetch that finds nothing. |
+| `VICTORY_WIDE_MERGE` | off; `play.ps1` sets `1` | Pieces the card's compare found differing are merged on several threads. Each piece is its own bytes of its copy and of title memory. |
+| `VICTORY_FRAME_TIMINGS` | off | `1` logs one line of stage times per presented frame (prepare, copies, copy-back, record, refresh, remap, and the six parts of preparing). |
 | `VICTORY_AMBIENT` | off | After the screen-probe resolve, replace its indirect light with a constant in `0.0..=1.0` so shadowed geometry is visible while ray tracing stays off. `0.25` is the laptop preset; `0.6` is brighter and can glow in fog. |
 | `VICTORY_CONSOLE` | Series X | `series-s` gives the title the smaller console: device type, under 8 GiB of title memory (7,776 MiB), a 1280x720 render and a 1920x1080 present. The presented frame is the rendered colour drawn over the upscaler's output, because that upscaler's own passes do not translate. |
 | `VICTORY_INPLACE` | `0` | Stays off. Reading title memory in place was slower. |
@@ -105,7 +130,7 @@ still forces the larger console.
 | `VICTORY_UPSCALE` | stand-in | `title` leaves Series S upscaling to the title's own passes, which do not translate, so the picture stays black. |
 | `VICTORY_UI_PLANE` | premultiplied | `0` leaves the title's interface plane out of the presented frame. `straight` blends it by straight alpha. |
 
-Series S is the memory cut on a 16 GB machine. Its title limit is 7,776 MiB, against about 13.5 GiB on Series X, and it draws a 720p picture into a 1080p present instead of a 1440p picture into a 4K one. The 21.5 GB private / 7.8 GB VRAM peak was the Series X profile with the switches above. A tighter texture cap than the small profile's is not applied: when the card was held under that cap, surfaces the title fills went untextured.
+Series S is the memory cut on a 16 GB machine. Its title limit is 7,776 MiB, against about 13.5 GiB on Series X, and it draws a 720p picture into a 1080p present instead of a 1440p picture into a 4K one. The 21.5 GB private / 7.8 GB VRAM peak was the Series X profile with the switches above. A tighter texture cap than the small profile's is not applied: when the card was held under that cap, surfaces the title fills went untextured. The 1 MiB windows, the tails and the shared buffer heaps are the cut aimed at the unread part of the 3.3 GB of windows and at one driver allocation per host copy. They do not drop texture levels. `VICTORY_FRAME_TIMINGS=1` prints each frame's stages so the next run on the laptop can say which of them is still the slow one.
 
 ## Status of this fork (2026-11-26, 11:50 UTC)
 

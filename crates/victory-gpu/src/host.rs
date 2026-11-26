@@ -87,6 +87,12 @@ static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::ne
 static PREP_PARTS: [std::sync::atomic::AtomicU64; 6] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 6];
 
+/// Preparing time by part, microseconds since the frame-rate line last
+/// took them ([`PREP_PARTS`]). The per-frame line reads the difference.
+pub(crate) fn prep_parts_us() -> [u64; 6] {
+    PREP_PARTS.each_ref().map(|p| p.load(Ordering::Relaxed))
+}
+
 /// Adds the time since `since` to part `i` of [`PREP_PARTS`]; now.
 fn prep_part(i: usize, since: std::time::Instant) -> std::time::Instant {
     let now = std::time::Instant::now();
@@ -11894,6 +11900,9 @@ impl Host {
     pub(crate) fn shared_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         MADE[2].fetch_add(1, Ordering::Relaxed);
         MADE[3].fetch_add(size, Ordering::Relaxed);
+        if let Some(placed) = crate::buffer_heaps::place(self, size) {
+            return Some(placed);
+        }
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_CUSTOM,
             CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,

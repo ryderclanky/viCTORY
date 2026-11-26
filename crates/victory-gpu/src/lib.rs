@@ -19,6 +19,8 @@
 mod ambient;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod backreads;
+#[cfg(windows)]
+mod buffer_heaps;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 #[cfg(windows)]
