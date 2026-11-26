@@ -84,7 +84,8 @@ static SHADERS: Mutex<Option<HashMap<[u8; 32], Arc<Shader>>>> = Mutex::new(None)
 
 /// For the memory lines: containers kept and their bytes, translations
 /// kept and the bytes of their host code. None of them is ever let go.
-static KEPT: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+static KEPT: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// What the shader table and the pipeline library keep in memory:
 /// containers and their bytes, translations and their bytes, the bytes of
@@ -124,7 +125,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 #[cfg(windows)]
                 walks: OnceLock::new(),
                 #[cfg(windows)]
-                resolves_light: bytes.windows(crate::ambient::PROGRAM.len())
+                resolves_light: bytes
+                    .windows(crate::ambient::PROGRAM.len())
                     .any(|w| w == crate::ambient::PROGRAM),
             })
         })
@@ -139,6 +141,9 @@ pub(crate) struct Translated {
     /// Whether the shader's code can store to buffer memory ([`stores`]);
     /// true when its code is not known.
     pub(crate) stores: bool,
+    /// A compute shader's group size (`numthreads`); `[0; 3]` for other
+    /// stages. A `DispatchX` that counts threads is made groups with it.
+    pub(crate) threads: [u32; 3],
 }
 
 #[cfg(windows)]
@@ -162,7 +167,10 @@ impl Shader {
                 }
                 if let Ok(t) = &done {
                     KEPT[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    KEPT[3].fetch_add(t.host.dxil.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                    KEPT[3].fetch_add(
+                        t.host.dxil.len() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                 }
                 match &done {
                     Ok(t) => tracing::info!(
@@ -197,17 +205,23 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     };
     let host = crate::shader_cache::host_shader(container)?;
     let stores = programs.is_empty() || programs.iter().any(stores);
-    let used = programs
-        .into_iter()
-        .find(|p| {
-            matches!(
-                p.stage,
-                HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs
-            )
-        })
-        .map(|p| p.used)
-        .unwrap_or_default();
-    Ok(Translated { host, used, stores })
+    let main = programs.into_iter().find(|p| {
+        matches!(
+            p.stage,
+            HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs
+        )
+    });
+    let threads = match main.as_ref().map(|p| &p.io) {
+        Some(victory_shader::native::StageIo::Cs(cs)) => cs.threads,
+        _ => [0; 3],
+    };
+    let used = main.map(|p| p.used).unwrap_or_default();
+    Ok(Translated {
+        host,
+        used,
+        stores,
+        threads,
+    })
 }
 
 /// The compute pipelines of the console's ray-tracing structure builder
@@ -273,7 +287,8 @@ fn of_builder(shaders: &[Arc<Shader>]) -> bool {
 #[cfg(windows)]
 pub(crate) fn builder_quarantined(this: This) -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    is_builder(this) && *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_QUARANTINE").is_some_and(|v| v == "1"))
+    is_builder(this)
+        && *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_QUARANTINE").is_some_and(|v| v == "1"))
 }
 
 #[cfg(windows)]
@@ -315,7 +330,10 @@ fn container_walks(container: &[u8]) -> bool {
 /// Whether native code has a ray-tracing node test.
 #[cfg(windows)]
 fn code_walks(code: &[u8]) -> bool {
-    victory_shader::gfx10::decode(code).is_ok_and(|code| code.iter().any(|i| i.name().is_some_and(|n| n.starts_with("image_bvh"))))
+    victory_shader::gfx10::decode(code).is_ok_and(|code| {
+        code.iter()
+            .any(|i| i.name().is_some_and(|n| n.starts_with("image_bvh")))
+    })
 }
 
 /// Dispatches held back by [`walk_held`] since the last frame line.
@@ -347,7 +365,9 @@ pub(crate) static WALKS_HELD: std::sync::atomic::AtomicU64 = std::sync::atomic::
 #[cfg(windows)]
 pub(crate) fn walk_held(this: This) -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    if this.is_null() || !*ON.get_or_init(|| std::env::var_os("VICTORY_BVH_HOLD").is_some_and(|v| v == "1")) {
+    if this.is_null()
+        || !*ON.get_or_init(|| std::env::var_os("VICTORY_BVH_HOLD").is_some_and(|v| v == "1"))
+    {
         return false;
     }
     let p = pipeline(this);
@@ -382,7 +402,10 @@ pub(crate) fn builder_off(why: &'static str) {
     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
     if !b.off {
         b.off = true;
-        tracing::warn!(why, "the ray-tracing structure builder is turned off for the rest of the run: its stages run all or none");
+        tracing::warn!(
+            why,
+            "the ray-tracing structure builder is turned off for the rest of the run: its stages run all or none"
+        );
     }
 }
 
@@ -404,6 +427,9 @@ pub(crate) fn builder_runs() -> bool {
     let missing = b.pipelines.iter().filter(|p| !make::now(p)).count();
     if missing > 0 {
         b.off = true;
+        for p in b.pipelines.iter().filter(|p| !make::now(p)) {
+            tracing::warn!(shaders = ?make::shaders(p), "a builder pipeline with no host pipeline");
+        }
         tracing::warn!(
             missing,
             of = b.pipelines.len(),
@@ -501,6 +527,27 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     make::ready(&pipeline(this).host)
 }
 
+/// As [`host_pipeline`], for a draw into render target and depth views of
+/// the formats `bound`: if a bound view has another format than the title's
+/// pipeline declares for its slot (`host::formats_differ`), the host
+/// pipeline of the same shaders and state made for the bound formats
+/// (`make::for_formats`). A draw whose views are as declared pays one
+/// comparison of the nine words.
+#[cfg(windows)]
+pub(crate) fn host_pipeline_for<'a>(
+    this: This,
+    bound: &host::TargetFormats,
+) -> Option<&'a host::HostPipeline> {
+    if this.is_null() {
+        return None;
+    }
+    let p = &pipeline(this).host;
+    if p.formats != *bound && host::formats_differ(&p.formats, bound) {
+        return make::for_formats(p, bound);
+    }
+    make::ready(p)
+}
+
 /// Host pipelines queued and not made yet.
 #[cfg(windows)]
 pub(crate) fn making() -> u64 {
@@ -576,7 +623,10 @@ pub(crate) fn note_drop(this: This) {
 pub(crate) fn note_why(why: String) {
     crate::capture::op(0, || format!("DROPPED {why}"));
     let mut drops = DROPS.lock().unwrap_or_else(|e| e.into_inner());
-    *drops.get_or_insert_with(HashMap::new).entry(why).or_default() += 1;
+    *drops
+        .get_or_insert_with(HashMap::new)
+        .entry(why)
+        .or_default() += 1;
 }
 
 /// The drops counted since the last call, most first (diagnostics).
@@ -620,6 +670,13 @@ fn hand_out(
         let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
         b.pipelines.push(host.clone());
         b.whole = false;
+        // Named once each (gfx41): which programs are the builder's, to
+        // match against the refused and untranslated ones.
+        tracing::info!(
+            n = b.pipelines.len(),
+            ?shaders,
+            "a pipeline of the ray-tracing structure builder"
+        );
     }
     let pipeline = Box::new(Pipeline {
         object: Object::new(&FUNCTIONS),
@@ -768,6 +825,17 @@ pub(crate) extern "system" fn create_stream(
             graphics.read(kind, desc.stream.add(at))
         };
         at += size;
+    }
+    // The whole state is read: integer targets do not blend on the host
+    // (`GraphicsState::integer_targets_do_not_blend`).
+    #[cfg(windows)]
+    if graphics.integer_targets_do_not_blend() {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| {
+            tracing::info!(
+                "a pipeline of the title's blends into a render target of integers: blending is off for that target on the host (said once)"
+            );
+        });
     }
     hand_out(
         shaders,

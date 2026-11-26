@@ -151,7 +151,9 @@ fn live_level() -> Option<f32> {
                 }
             });
     });
-    LIVE.lock().unwrap_or_else(|e| e.into_inner()).map(|(level, _)| level)
+    LIVE.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .map(|(level, _)| level)
 }
 
 const SOURCE: &str = r#"
@@ -377,7 +379,8 @@ pub(crate) fn raise(list: &HostList, light: This, depth: Option<This>) -> bool {
         let beside = D3D12_CPU_DESCRIPTOR_HANDLE {
             ptr: at.ptr + pass.step as usize,
         };
-        host.device.CreateShaderResourceView(depth, Some(&seen), beside);
+        host.device
+            .CreateShaderResourceView(depth, Some(&seen), beside);
         l.SetDescriptorHeaps(&[Some(pass.views.clone())]);
         l.SetComputeRootSignature(&pass.root);
         l.SetPipelineState(&pass.pso);

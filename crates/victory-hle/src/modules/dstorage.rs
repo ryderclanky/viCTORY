@@ -146,7 +146,10 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
     let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file });
-    WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner()).push((file as usize, kept));
+    WALLS_FILES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((file as usize, kept));
     put(out, file)
 }
 
@@ -358,6 +361,20 @@ struct Lanes {
     /// BCPack bytes written and time spent on them.
     bcpack: (u64, std::time::Duration),
     since: Option<std::time::Instant>,
+    /// Reads held back for the title's Submit when a half-full queue
+    /// submitted itself, since the last line: Submits that released some,
+    /// entries released, and the wait (sum, most) from the first hold to
+    /// that Submit (µs); when the last line was written. (A lead for the
+    /// stand-in models and the haze: a batch of streamed data waits here
+    /// for one call of the title's; gfx41.)
+    held_waits: (u64, u64, u64, u64),
+    held_line: Option<std::time::Instant>,
+    /// Since the last 5 s line: the slowest request run (ms, destination
+    /// bytes, options), and requests over 250 ms and over 1 s, plain and
+    /// BCPack apart (gfx41: BCPack decodes at about 12 MB/s a worker in run
+    /// 327, and a status waits for every earlier request of its queue).
+    slowest: (u64, u32, u64),
+    slow: [u64; 4],
 }
 
 /// A queue's requests in the scheduler.
@@ -371,6 +388,8 @@ struct Lane {
     /// Left out when the queue submitted itself, until the title's Submit:
     /// reads into physical pages and the status entries behind them.
     held: Vec<Command>,
+    /// When the first of `held` was left out (for the held-wait line).
+    held_since: Option<std::time::Instant>,
     /// Submitted, by sequence number: reads not started, status entries
     /// not written, reads running, and failures not yet reported.
     reads: VecDeque<(u64, Request)>,
@@ -418,6 +437,10 @@ fn scheduler() -> Option<&'static Scheduler> {
                     refused: 0,
                     bcpack: Default::default(),
                     since: None,
+                    held_waits: Default::default(),
+                    held_line: None,
+                    slowest: (0, 0, 0),
+                    slow: [0; 4],
                 }),
                 work: Condvar::new(),
                 finished: Condvar::new(),
@@ -452,7 +475,10 @@ impl Scheduler {
 fn walls_trace() -> u8 {
     static ON: OnceLock<u8> = OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("VICTORY_WALLS_TRACE").ok().and_then(|v| v.trim().parse::<u8>().ok()).unwrap_or(0)
+        std::env::var("VICTORY_WALLS_TRACE")
+            .ok()
+            .and_then(|v| v.trim().parse::<u8>().ok())
+            .unwrap_or(0)
     })
 }
 
@@ -471,7 +497,10 @@ fn walls_request(request: &Request, result: &Result<(), HRESULT>, started: std::
     } else {
         let files = WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner());
         let source = request.source as usize;
-        files.iter().find(|f| f.0 == source).map_or_else(|| "?".to_string(), |f| f.1.clone())
+        files
+            .iter()
+            .find(|f| f.0 == source)
+            .map_or_else(|| "?".to_string(), |f| f.1.clone())
     };
     let hr = match result {
         Ok(()) => 0,
@@ -499,14 +528,18 @@ fn work(scheduler: &'static Scheduler) {
     #[cfg(windows)]
     {
         static SLOW: OnceLock<bool> = OnceLock::new();
-        if *SLOW.get_or_init(|| std::env::var_os("VICTORY_DISK_CORES").is_some_and(|v| v == "slow")) {
+        if *SLOW.get_or_init(|| std::env::var_os("VICTORY_DISK_CORES").is_some_and(|v| v == "slow"))
+        {
             victory_gpu::framelog::keep_on_slow_cores("dstorage worker");
         }
     }
     let mut lanes = scheduler.lock();
     loop {
         let Some(job) = lanes.start() else {
-            lanes = scheduler.work.wait(lanes).unwrap_or_else(|e| e.into_inner());
+            lanes = scheduler
+                .work
+                .wait(lanes)
+                .unwrap_or_else(|e| e.into_inner());
             continue;
         };
         drop(lanes);
@@ -541,6 +574,17 @@ impl Lanes {
             self.bcpack.0 += u64::from(job.request.destination_size);
             self.bcpack.1 += started.elapsed();
         }
+        let ms = started.elapsed().as_millis() as u64;
+        let bc = job.request.options & BCPACK != 0;
+        if ms > self.slowest.0 {
+            self.slowest = (ms, job.request.destination_size, job.request.options);
+        }
+        if ms >= 250 {
+            self.slow[usize::from(bc) * 2] += 1;
+        }
+        if ms >= 1000 {
+            self.slow[usize::from(bc) * 2 + 1] += 1;
+        }
         let since = *self.since.get_or_insert(started);
         let elapsed = since.elapsed();
         if elapsed.as_secs() >= 5 {
@@ -553,10 +597,27 @@ impl Lanes {
                 reading_workers = format_args!("{:.2}", reading / elapsed.as_secs_f64()),
                 staging_waits = std::mem::take(&mut self.refused),
                 bcpack_mb = self.bcpack.0 / 1_000_000,
-                bcpack_workers = format_args!("{:.2}", self.bcpack.1.as_secs_f64() / elapsed.as_secs_f64()),
+                bcpack_workers =
+                    format_args!("{:.2}", self.bcpack.1.as_secs_f64() / elapsed.as_secs_f64()),
                 waiting,
                 "dstorage: last {:.1} s",
                 elapsed.as_secs_f64()
+            );
+            let (ms, bytes, options) = std::mem::take(&mut self.slowest);
+            let slow = std::mem::take(&mut self.slow);
+            tracing::info!(
+                "dstorage, slowest request in the last {:.1} s: {ms} ms for {:.1} MB (options {options:#x}{}); requests over                  250 ms: {} plain, {} BCPack; over 1 s: {} plain, {} BCPack (a status behind such a request on its queue                  waits that long)",
+                elapsed.as_secs_f64(),
+                f64::from(bytes) / 1e6,
+                if options & BCPACK != 0 {
+                    ", BCPack"
+                } else {
+                    ""
+                },
+                slow[0],
+                slow[2],
+                slow[1],
+                slow[3],
             );
             self.done = Default::default();
             self.bcpack = Default::default();
@@ -641,7 +702,23 @@ impl Lanes {
         if lane.reads.is_empty() {
             lane.clock = lane.clock.max(self.lane_now[class]);
         }
-        let mut commands = if explicit { std::mem::take(&mut lane.held) } else { Vec::new() };
+        let now = std::time::Instant::now();
+        // The title's Submit releases what a self-submit held: how long it waited.
+        let released = if explicit && !lane.held.is_empty() {
+            lane.held_since.take().map(|since| {
+                (
+                    lane.held.len() as u64,
+                    now.saturating_duration_since(since).as_micros() as u64,
+                )
+            })
+        } else {
+            None
+        };
+        let mut commands = if explicit {
+            std::mem::take(&mut lane.held)
+        } else {
+            Vec::new()
+        };
         commands.append(&mut lane.unsubmitted);
         for command in commands {
             let hold = !explicit
@@ -660,7 +737,38 @@ impl Lanes {
                 Command::Status(status) => lane.statuses.push_back((seq, status)),
             }
         }
+        if !lane.held.is_empty() && lane.held_since.is_none() {
+            lane.held_since = Some(now);
+        }
         lane.flush();
+        if let Some((entries, us)) = released {
+            let w = &mut self.held_waits;
+            w.0 += 1;
+            w.1 += entries;
+            w.2 += us;
+            w.3 = w.3.max(us);
+        }
+        self.held_line(now);
+    }
+
+    /// Every 5 s while it has something: [`Lanes::held_waits`] as one line.
+    fn held_line(&mut self, now: std::time::Instant) {
+        let since = *self.held_line.get_or_insert(now);
+        let secs = now.saturating_duration_since(since).as_secs_f64();
+        if secs < 5.0 {
+            return;
+        }
+        self.held_line = Some(now);
+        let (releases, entries, sum, most) = std::mem::take(&mut self.held_waits);
+        let held_now: usize = self.lanes.values().map(|l| l.held.len()).sum();
+        if releases == 0 && held_now == 0 {
+            return;
+        }
+        tracing::info!(
+            "dstorage reads held for the title's Submit after a queue submitted itself, last {secs:.1} s: {releases} Submits released {entries} entries, waited {:.1} ms on average, {:.1} ms at most; held now {held_now}",
+            sum as f64 / releases.max(1) as f64 / 1e3,
+            most as f64 / 1e3,
+        );
     }
 }
 
@@ -672,6 +780,7 @@ impl Lane {
             clock: 0,
             unsubmitted: Vec::new(),
             held: Vec::new(),
+            held_since: None,
             reads: VecDeque::new(),
             statuses: VecDeque::new(),
             running: BTreeSet::new(),
@@ -693,7 +802,11 @@ impl Lane {
     fn flush(&mut self) {
         while let Some(&(seq, _)) = self.statuses.front() {
             let waiting = self.reads.front().map(|r| r.0);
-            if waiting.into_iter().chain(self.running.first().copied()).any(|s| s < seq) {
+            if waiting
+                .into_iter()
+                .chain(self.running.first().copied())
+                .any(|s| s < seq)
+            {
                 return;
             }
             let Some((_, status)) = self.statuses.pop_front() else {
@@ -787,7 +900,6 @@ enum Command {
     Status(Status),
 }
 
-
 /// A status entry to write, holding a reference on its array.
 struct Status {
     array: Array,
@@ -851,7 +963,9 @@ fn queue(this: QueueRef, command: Command) {
         if !lane.held.is_empty() {
             static WARNED: AtomicBool = AtomicBool::new(false);
             if !WARNED.swap(true, Ordering::Relaxed) {
-                tracing::warn!("dstorage: a full queue's reads into physical pages start before the title's Submit");
+                tracing::warn!(
+                    "dstorage: a full queue's reads into physical pages start before the title's Submit"
+                );
             }
             lanes.submit(id);
             scheduler.work.notify_all();
@@ -889,7 +1003,10 @@ extern "system" fn submit(this: QueueRef) {
         return;
     };
     let mut lanes = scheduler.lock();
-    let pending = lanes.lanes.get(&id).map_or(0, |l| l.unsubmitted.len() + l.held.len());
+    let pending = lanes
+        .lanes
+        .get(&id)
+        .map_or(0, |l| l.unsubmitted.len() + l.held.len());
     tracing::debug!(commands = pending, "dstorage: submit");
     lanes.submit(id);
     scheduler.work.notify_all();
@@ -953,7 +1070,11 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
         })
         .map_err(|hr| fail(hr, "copying"));
     }
-    let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
+    let tables = if bc != 0 {
+        Some(bcpack_tables()?)
+    } else {
+        None
+    };
     let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
     // The console's order: zlib first, then BCPack.
     let source = if bc != 0 && options & ZLIB != 0 {
@@ -1061,7 +1182,9 @@ fn use_bcpack_tables(dir: std::path::PathBuf) {
 
 #[cfg(test)]
 fn load_bcpack_tables() -> Result<Tables, String> {
-    let dir = BCPACK_DIR.get().ok_or("no folder set for the test tables")?;
+    let dir = BCPACK_DIR
+        .get()
+        .ok_or("no folder set for the test tables")?;
     let bytes = std::fs::read(dir.join("tables.bin")).map_err(|e| e.to_string())?;
     Tables::parse(&bytes).map_err(|e| e.to_string())
 }
@@ -1087,7 +1210,9 @@ static READING: AtomicU64 = AtomicU64::new(0);
 fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
     if request.options & MEMORY_SOURCE != 0 {
         // SAFETY: the title's source holds `out.len()` bytes until completion.
-        out.copy_from_slice(unsafe { std::slice::from_raw_parts(request.source.cast(), out.len()) });
+        out.copy_from_slice(unsafe {
+            std::slice::from_raw_parts(request.source.cast(), out.len())
+        });
         return Ok(());
     }
     // SAFETY: a file object we created; the title keeps it open.
@@ -1170,7 +1295,10 @@ fn into_destination(
     // that tried again (run 165) lost none of 13.
     static RETRIES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     let retries = *RETRIES.get_or_init(|| {
-        std::env::var("VICTORY_DSTORAGE_RETRIES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(12)
+        std::env::var("VICTORY_DSTORAGE_RETRIES")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(12)
     });
     // Since the start: writes that succeeded on a later try, and writes
     // given up.
@@ -1178,7 +1306,9 @@ fn into_destination(
     let mut written = super::xmem::write_physical(pages, offset, &data[..n]);
     let mut tries = 0u32;
     while !written && tries < retries {
-        std::thread::sleep(std::time::Duration::from_millis((2u64 << tries.min(6)).min(128)));
+        std::thread::sleep(std::time::Duration::from_millis(
+            (2u64 << tries.min(6)).min(128),
+        ));
         tries += 1;
         written = super::xmem::write_physical(pages, offset, &data[..n]);
     }
@@ -1388,8 +1518,7 @@ mod tests {
 
     fn compress_zlib(plain: &[u8]) -> Vec<u8> {
         let mut buf = vec![0u8; zlib_rs::compress_bound(plain.len())];
-        let (packed, rc) =
-            zlib_rs::compress_slice(&mut buf, plain, zlib_rs::DeflateConfig::new(6));
+        let (packed, rc) = zlib_rs::compress_slice(&mut buf, plain, zlib_rs::DeflateConfig::new(6));
         assert_eq!(rc, zlib_rs::ReturnCode::Ok);
         packed.to_vec()
     }
@@ -1456,7 +1585,8 @@ mod tests {
         // Requests in flight together run in any order, so none of them
         // shares a destination (failed ones leave theirs undefined).
         let mut buffers = [[0u8; 16]; 5];
-        let [failed, failed_too, out, other, bcpack] = buffers.each_mut().map(|b| b.as_mut_ptr().cast());
+        let [failed, failed_too, out, other, bcpack] =
+            buffers.each_mut().map(|b| b.as_mut_ptr().cast());
 
         // Segment 0: a read past the end, then a bad stream; the first wins.
         enqueue(queue, &request(0, failed, 16, file, 4090, 16));
@@ -1518,6 +1648,10 @@ mod tests {
             refused: 0,
             bcpack: Default::default(),
             since: None,
+            held_waits: Default::default(),
+            held_line: None,
+            slowest: (0, 0, 0),
+            slow: [0; 4],
         }
     }
 
@@ -1672,7 +1806,10 @@ mod tests {
         let (_dir, file) = file_with(&contents);
         let (queue, array) = (new_queue(0), status_array(1));
         let mut out = [0u8; 16];
-        enqueue(queue, &request(4 << 1, out.as_mut_ptr().cast(), 16, file, 100, 88));
+        enqueue(
+            queue,
+            &request(4 << 1, out.as_mut_ptr().cast(), 16, file, 100, 88),
+        );
         enqueue_status(queue, array, 0);
         void(queue, 0x30);
         assert_eq!(wait(array, 0), S_OK);
@@ -1743,7 +1880,11 @@ mod tests {
         read(&mut l, 0, PAGE_DESTINATION, 16);
         read(&mut l, 0, 0, 16);
         add_ref_instance(array);
-        l.lanes.get_mut(&0).unwrap().unsubmitted.push(Command::Status(Status { array, index: 0 }));
+        l.lanes
+            .get_mut(&0)
+            .unwrap()
+            .unsubmitted
+            .push(Command::Status(Status { array, index: 0 }));
         l.submit_as(0, false);
         // Only the plain read starts; the status waits behind the held one.
         let plain = l.start().unwrap();
@@ -1776,7 +1917,10 @@ mod tests {
             0x04,
         );
         assert!(!mapped.is_null());
-        assert_eq!(xmem::XMemMapPhysicalPages(mapped, 2, pages.as_ptr()), mapped);
+        assert_eq!(
+            xmem::XMemMapPhysicalPages(mapped, 2, pages.as_ptr()),
+            mapped
+        );
         // The title's page table: still the page's previous owner when the
         // request is enqueued, the right page by its Submit.
         let mut list = [pages[0]];
@@ -1803,7 +1947,17 @@ mod tests {
         );
         enqueue(queue, &r);
         let mut out = [0u8; 16];
-        enqueue(queue, &request(MEMORY_SOURCE, out.as_mut_ptr().cast(), 16, plain.as_ptr().cast(), 0, 16));
+        enqueue(
+            queue,
+            &request(
+                MEMORY_SOURCE,
+                out.as_mut_ptr().cast(),
+                16,
+                plain.as_ptr().cast(),
+                0,
+                16,
+            ),
+        );
         // Half of four: the queue submitted itself. Time for a read started
         // then to land in the old page.
         std::thread::sleep(std::time::Duration::from_millis(50));

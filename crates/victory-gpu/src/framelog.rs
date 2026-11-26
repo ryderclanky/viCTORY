@@ -100,6 +100,88 @@ pub enum T {
     WorkerSlow,
     RecordLooks,
     RecordSlow,
+    /// The runtime's changes of what title memory shows, by part
+    /// (`victory-hle` `xmem.rs`): microseconds in the system's unmapping
+    /// calls, in its mapping calls (the split of the placeholder and the
+    /// mapping itself), in committing, and in the layer's own notes of the
+    /// change (`title_memory_remapped`, `title_memory_view`); then the views
+    /// that reached outside the range asked for and were mapped again there,
+    /// and those bytes.
+    RemapUnmapUs,
+    RemapMapUs,
+    RemapCommitUs,
+    RemapNotesUs,
+    RemapCuts,
+    RemapCutBytes,
+    /// The remapping meter (`victory-hle` `xmem.rs`, `Meter`): the system's
+    /// unmapping and mapping calls counted (a remapping call of the title
+    /// makes none, one or many of each); the processor cycles the calling
+    /// thread used inside them and the processor's clock over the same
+    /// calls (their ratio is the share of the calls' time the thread was
+    /// on a processor: the rest it stood blocked in the kernel); and the
+    /// calls by length (under 50 us, to 200 us, to 1 ms, longer): how many
+    /// and their microseconds.
+    RemapUnmapCalls,
+    RemapUnmapCycles,
+    RemapUnmapTsc,
+    RemapUnmapC0,
+    RemapUnmapC1,
+    RemapUnmapC2,
+    RemapUnmapC3,
+    RemapUnmapU0,
+    RemapUnmapU1,
+    RemapUnmapU2,
+    RemapUnmapU3,
+    RemapMapCalls,
+    RemapMapCycles,
+    RemapMapTsc,
+    RemapMapC0,
+    RemapMapC1,
+    RemapMapC2,
+    RemapMapC3,
+    RemapMapU0,
+    RemapMapU1,
+    RemapMapU2,
+    RemapMapU3,
+    /// Mappings tried a second time after the placeholder was split
+    /// (`VICTORY_REMAP_SPLIT`); splits of a placeholder tried, those that
+    /// split one, and their microseconds.
+    RemapMapRetries,
+    RemapSplits,
+    RemapSplitsDone,
+    RemapSplitUs,
+    /// The queue's page-mapping copies as the runtime sees them
+    /// (`map_alias`): calls and their microseconds from entry to return
+    /// (the wait for the page table's lock included, which `RemapUs` leaves
+    /// out); pages mapped, those that were the next page of the same
+    /// section after the page mapped just before at the address just
+    /// before (one view could show both), and those that were the same
+    /// page as it (no view can).
+    RemapAliasCalls,
+    RemapAliasUs,
+    RemapAliasPages,
+    RemapAliasRunPages,
+    RemapAliasSamePages,
+    /// The title's own mapping calls (`XMemMapPhysicalPages`, and each page
+    /// of `XMemMapPhysicalPagesScatter`): calls, microseconds, pages.
+    RemapDirectCalls,
+    RemapDirectUs,
+    RemapDirectPages,
+    /// The queue's page-mapping copies as the title asks for them
+    /// (`queue.rs` `copy_page_mappings`): calls, and ranges and pages by
+    /// kind (0 pool pages in a row, 1 one pool page each, 2 unmapped).
+    PageMapCalls,
+    PageMapRanges0,
+    PageMapPages0,
+    PageMapRanges1,
+    PageMapPages1,
+    PageMapRanges2,
+    PageMapPages2,
+    /// Views of our own on physical pages for DirectStorage's writes
+    /// (`xmem.rs` `View`): how many, and the microseconds mapping,
+    /// committing and unmapping them.
+    DiskViews,
+    DiskViewUs,
     Count,
 }
 
@@ -178,19 +260,37 @@ pub fn on_slow_core() -> bool {
 /// The system's processor sets of group 0: each one's id, its logical
 /// processor and its efficiency class (higher is faster).
 fn cpu_sets() -> Vec<(u32, u8, u8)> {
-    use windows_sys::Win32::System::SystemInformation::{GetSystemCpuSetInformation, SYSTEM_CPU_SET_INFORMATION};
+    use windows_sys::Win32::System::SystemInformation::{
+        GetSystemCpuSetInformation, SYSTEM_CPU_SET_INFORMATION,
+    };
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut bytes = 0u32;
     // SAFETY: a size query, then the call into a buffer of that size.
-    unsafe { GetSystemCpuSetInformation(std::ptr::null_mut(), 0, &mut bytes, GetCurrentProcess(), 0) };
+    unsafe {
+        GetSystemCpuSetInformation(std::ptr::null_mut(), 0, &mut bytes, GetCurrentProcess(), 0)
+    };
     let mut buffer = vec![0u64; (bytes as usize).div_ceil(8).max(1)];
     // SAFETY: as above; the buffer holds `bytes` bytes, aligned for the records.
-    let ok = unsafe { GetSystemCpuSetInformation(buffer.as_mut_ptr().cast(), bytes, &mut bytes, GetCurrentProcess(), 0) };
+    let ok = unsafe {
+        GetSystemCpuSetInformation(
+            buffer.as_mut_ptr().cast(),
+            bytes,
+            &mut bytes,
+            GetCurrentProcess(),
+            0,
+        )
+    };
     let mut sets = Vec::new();
     let mut at = 0usize;
     while ok != 0 && at + size_of::<SYSTEM_CPU_SET_INFORMATION>() <= bytes as usize {
         // SAFETY: a record inside the buffer; each says its own size.
-        let info = unsafe { &*(buffer.as_ptr().cast::<u8>().add(at).cast::<SYSTEM_CPU_SET_INFORMATION>()) };
+        let info = unsafe {
+            &*(buffer
+                .as_ptr()
+                .cast::<u8>()
+                .add(at)
+                .cast::<SYSTEM_CPU_SET_INFORMATION>())
+        };
         if info.Size == 0 {
             break;
         }
@@ -209,7 +309,9 @@ fn cpu_sets() -> Vec<(u32, u8, u8)> {
 pub fn slow_processors() -> usize {
     let sets = cpu_sets();
     let best = sets.iter().map(|c| c.2).max().unwrap_or(0);
-    sets.iter().filter(|c| c.2 < best && c.1 < usize::BITS as u8).fold(0, |mask, c| mask | 1usize << c.1)
+    sets.iter()
+        .filter(|c| c.2 < best && c.1 < usize::BITS as u8)
+        .fold(0, |mask, c| mask | 1usize << c.1)
 }
 
 /// Asks the system to run the calling thread on the fast cores only, where
@@ -235,11 +337,17 @@ pub fn keep_on_fast_cores(what: &str) {
         return;
     }
     // SAFETY: our own thread and a list of the system's own set ids.
-    let ok = unsafe { SetThreadSelectedCpuSets(GetCurrentThread(), fast.as_ptr(), fast.len() as u32) };
+    let ok =
+        unsafe { SetThreadSelectedCpuSets(GetCurrentThread(), fast.as_ptr(), fast.len() as u32) };
     if ok == 0 {
         tracing::warn!(what, error = %std::io::Error::last_os_error(), "the thread could not be kept on the fast cores");
     } else {
-        tracing::info!(what, fast = fast.len(), of = sets.len(), "the thread is kept on the fast cores (VICTORY_FAST_CORES=0: not)");
+        tracing::info!(
+            what,
+            fast = fast.len(),
+            of = sets.len(),
+            "the thread is kept on the fast cores (VICTORY_FAST_CORES=0: not)"
+        );
     }
 }
 
@@ -263,10 +371,18 @@ pub fn keep_on_slow_cores(what: &str) -> bool {
         return false;
     }
     // SAFETY: our own thread and a list of the system's own set ids.
-    let ok = unsafe { SetThreadSelectedCpuSets(GetCurrentThread(), slow.as_ptr(), slow.len() as u32) } != 0;
+    let ok =
+        unsafe { SetThreadSelectedCpuSets(GetCurrentThread(), slow.as_ptr(), slow.len() as u32) }
+            != 0;
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
-        tracing::info!(what, slow = slow.len(), of = sets.len(), ok, "helper threads are kept on the slow cores: the first one");
+        tracing::info!(
+            what,
+            slow = slow.len(),
+            of = sets.len(),
+            ok,
+            "helper threads are kept on the slow cores: the first one"
+        );
     });
     ok
 }
@@ -288,10 +404,21 @@ fn micros(t: windows_sys::Win32::Foundation::FILETIME) -> u64 {
 pub fn thread_times() -> (u64, u64) {
     use windows_sys::Win32::Foundation::FILETIME;
     use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
-    let zero = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+    let zero = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
     let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
     // SAFETY: our own thread and four valid out pointers.
-    unsafe { GetThreadTimes(GetCurrentThread(), &mut created, &mut exited, &mut kernel, &mut user) };
+    unsafe {
+        GetThreadTimes(
+            GetCurrentThread(),
+            &mut created,
+            &mut exited,
+            &mut kernel,
+            &mut user,
+        )
+    };
     (micros(user), micros(kernel))
 }
 
@@ -299,16 +426,29 @@ pub fn thread_times() -> (u64, u64) {
 fn process_times() -> (u64, u64) {
     use windows_sys::Win32::Foundation::FILETIME;
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
-    let zero = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+    let zero = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
     let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
     // SAFETY: our own process and four valid out pointers.
-    unsafe { GetProcessTimes(GetCurrentProcess(), &mut created, &mut exited, &mut kernel, &mut user) };
+    unsafe {
+        GetProcessTimes(
+            GetCurrentProcess(),
+            &mut created,
+            &mut exited,
+            &mut kernel,
+            &mut user,
+        )
+    };
     (micros(user), micros(kernel))
 }
 
 /// The process's page faults so far (soft and hard).
 fn page_faults() -> u64 {
-    use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     // SAFETY: plain data the call fills in.
     let mut c: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
@@ -404,7 +544,7 @@ fn text(f: &Frame) -> String {
     let ms = |x: T| f.t[x as usize] / 1e3;
     let s = |i: usize| f.s[i];
     let h = |x: H| f.h[x as usize];
-    format!(
+    let line = format!(
         "{:.0} ms | render thread: ran {:.0} ms (user {:.0}, kernel {:.0}); in the present call {:.1} (lines and settling \
          {:.1}, copy and show {:.1}), in submit calls {:.1}, in list calls {:.1}, paced {:.1} | submit thread: at work \
          {:.1} ms (user {:.1}, kernel {:.1}); {:.0} submissions, preparing {:.1}, waiting for the card {:.1}; copies {:.1} \
@@ -412,7 +552,8 @@ fn text(f: &Frame) -> String {
          send-and-hash lists {:.1} ms in {:.0}, our compare lists {:.1} ms in {:.0}, all other lists {:.1} ms in {:.0} | \
          recording, all threads: {:.1} ms in {:.0} calls; all submit calls {:.1} ms | textures: refresh {:.1} ms ({:.1} waiting for memory to hold \
          still), {:.0} uploads, staging {:.0} made {:.0} reused | remapping: {:.0} calls {:.1} ms ({:.1} waiting for \
-         readers) | pipelines: {:.0} made, {:.0} loaded, {:.1} ms waited | disk: {:.0} reads {:.1} MB {:.1} worker ms | \
+         readers; of it the system's unmapping {:.1}, its mapping {:.1}, committing {:.1}, our own notes of the change \
+         {:.1}; {:.0} views cut, {:.1} MB of them mapped again) | pipelines: {:.0} made, {:.0} loaded, {:.1} ms waited | disk: {:.0} reads {:.1} MB {:.1} worker ms | \
          faults: {:.0} page, {:.0} guard | process: {:.0} user {:.0} kernel ms | pacing, all threads {:.1} ms | {:.0} \
          draws | {:.0} MB free | found on a slow core: the render thread {:.0} of {:.0} looks, the submit thread {:.0} of {:.0}, recording threads {:.0} of {:.0}",
         f.us / 1e3,
@@ -454,6 +595,12 @@ fn text(f: &Frame) -> String {
         t(T::Remaps),
         ms(T::RemapUs),
         ms(T::RemapWaitUs),
+        ms(T::RemapUnmapUs),
+        ms(T::RemapMapUs),
+        ms(T::RemapCommitUs),
+        ms(T::RemapNotesUs),
+        t(T::RemapCuts),
+        t(T::RemapCutBytes) / (1 << 20) as f64,
         s(S_PIPELINES_MADE),
         s(S_PIPELINES_LOADED),
         ms(T::PipelineWaitUs),
@@ -473,13 +620,89 @@ fn text(f: &Frame) -> String {
         t(T::WorkerLooks),
         t(T::RecordSlow),
         t(T::RecordLooks),
+    );
+    line + &remap_meter(f)
+}
+
+/// The remapping meter's part of a frame's line (the totals are described
+/// at [`T::RemapUnmapCalls`] and after it).
+fn remap_meter(f: &Frame) -> String {
+    let t = |x: T| f.t[x as usize];
+    let ms = |x: T| f.t[x as usize] / 1e3;
+    // The share of the calls' time their thread was on a processor. The
+    // cycles are read just outside the clock's two readings, so a short
+    // call can come out a little over the whole.
+    let on = |cycles: T, tsc: T| {
+        if t(tsc) > 0.0 {
+            (100.0 * t(cycles) / t(tsc)).min(100.0)
+        } else {
+            0.0
+        }
+    };
+    format!(
+        " | remapping, metered: {:.0} system unmaps (on a processor {:.0} % of their time; under 50 us {:.0} = {:.1} ms, \
+         to 200 us {:.0} = {:.1}, to 1 ms {:.0} = {:.1}, longer {:.0} = {:.1}), {:.0} system maps (on a processor {:.0} %; \
+         under 50 us {:.0} = {:.1} ms, to 200 us {:.0} = {:.1}, to 1 ms {:.0} = {:.1}, longer {:.0} = {:.1}; {:.0} tried again \
+         after a split); splits tried {:.0}, needed {:.0}, {:.1} ms; through the queue's page-mapping copies {:.0} calls \
+         {:.1} ms with the wait for the page table ({:.0} copies: {:.0} ranges {:.0} pages of pool pages in a row, {:.0} \
+         ranges {:.0} pages of one pool page each, {:.0} ranges {:.0} pages unmapped), {:.0} pages mapped, {:.0} the next \
+         page after the one before, {:.0} the same page as the one before; the title's own mapping calls {:.0}, {:.1} \
+         ms, {:.0} pages; views for disk writes {:.0}, {:.1} ms",
+        t(T::RemapUnmapCalls),
+        on(T::RemapUnmapCycles, T::RemapUnmapTsc),
+        t(T::RemapUnmapC0),
+        ms(T::RemapUnmapU0),
+        t(T::RemapUnmapC1),
+        ms(T::RemapUnmapU1),
+        t(T::RemapUnmapC2),
+        ms(T::RemapUnmapU2),
+        t(T::RemapUnmapC3),
+        ms(T::RemapUnmapU3),
+        t(T::RemapMapCalls),
+        on(T::RemapMapCycles, T::RemapMapTsc),
+        t(T::RemapMapC0),
+        ms(T::RemapMapU0),
+        t(T::RemapMapC1),
+        ms(T::RemapMapU1),
+        t(T::RemapMapC2),
+        ms(T::RemapMapU2),
+        t(T::RemapMapC3),
+        ms(T::RemapMapU3),
+        t(T::RemapMapRetries),
+        t(T::RemapSplits),
+        t(T::RemapSplitsDone),
+        ms(T::RemapSplitUs),
+        t(T::RemapAliasCalls),
+        ms(T::RemapAliasUs),
+        t(T::PageMapCalls),
+        t(T::PageMapRanges0),
+        t(T::PageMapPages0),
+        t(T::PageMapRanges1),
+        t(T::PageMapPages1),
+        t(T::PageMapRanges2),
+        t(T::PageMapPages2),
+        t(T::RemapAliasPages),
+        t(T::RemapAliasRunPages),
+        t(T::RemapAliasSamePages),
+        t(T::RemapDirectCalls),
+        ms(T::RemapDirectUs),
+        t(T::RemapDirectPages),
+        t(T::DiskViews),
+        ms(T::DiskViewUs),
     )
 }
 
 /// The mean of `frames` (not empty).
 fn mean(frames: &[&Frame]) -> Frame {
     let n = frames.len() as f64;
-    let mut out = Frame { number: 0, at: 0.0, us: 0.0, t: [0.0; N], s: [0.0; S], h: [0.0; HN] };
+    let mut out = Frame {
+        number: 0,
+        at: 0.0,
+        us: 0.0,
+        t: [0.0; N],
+        s: [0.0; S],
+        h: [0.0; HN],
+    };
     for f in frames {
         out.us += f.us / n;
         for i in 0..N {
@@ -505,7 +728,10 @@ fn long_over(usual: f64) -> f64 {
 fn lines(frames: &[Frame], usual: f64, seconds: f64) -> Vec<String> {
     let over = long_over(usual);
     let (long, plain): (Vec<&Frame>, Vec<&Frame>) = frames.iter().partition(|f| f.us > over);
-    let each: Vec<String> = frames.iter().map(|f| format!("{:.0}", f.us / 1e3)).collect();
+    let each: Vec<String> = frames
+        .iter()
+        .map(|f| format!("{:.0}", f.us / 1e3))
+        .collect();
     let shortest = frames.iter().map(|f| f.us).fold(f64::INFINITY, f64::min);
     let longest = frames.iter().map(|f| f.us).fold(0.0, f64::max);
     let mut out = vec![format!(
@@ -521,13 +747,25 @@ fn lines(frames: &[Frame], usual: f64, seconds: f64) -> Vec<String> {
         each.join(" ")
     )];
     if !plain.is_empty() {
-        out.push(format!("usual frame (the mean of {} not long): {}", plain.len(), text(&mean(&plain))));
+        out.push(format!(
+            "usual frame (the mean of {} not long): {}",
+            plain.len(),
+            text(&mean(&plain))
+        ));
     }
     for f in long.iter().take(LONG_MOST) {
-        out.push(format!("long frame {} at {:.1} s: {}", f.number, f.at, text(f)));
+        out.push(format!(
+            "long frame {} at {:.1} s: {}",
+            f.number,
+            f.at,
+            text(f)
+        ));
     }
     if long.len() > LONG_MOST {
-        out.push(format!("long frames: {} more in this reading are not listed", long.len() - LONG_MOST));
+        out.push(format!(
+            "long frames: {} more in this reading are not listed",
+            long.len() - LONG_MOST
+        ));
     }
     out
 }
@@ -598,6 +836,36 @@ pub fn frame() {
     for line in lines(&frames, usual, elapsed.as_secs_f64()) {
         tracing::info!("{line}");
     }
+    tracing::info!("{}", kinds(&frames));
+}
+
+/// Host submissions a frame from which a frame counts as one of the world:
+/// the title's frame there is a burst (9 to 12 host submissions at the boat
+/// save, 29 in the first rooms); its menus, fades and loading screens send
+/// two or three and run at the title's own 30 a second.
+const WORLD_SUBMISSIONS: f64 = 6.0;
+
+/// One more line of a reading: the frames of the world apart from the
+/// others, each kind with its own time. A run's frames a second over "the
+/// world phase" counted both: runs 306 and 308 (the boat save) read 9.1 and
+/// 9.6 a second with 6.7 and 6.2 in the world's own frames, and run 309
+/// read 9.3 with 8.7 there, so a gain of a third looked like none.
+fn kinds(frames: &[Frame]) -> String {
+    let (world, other): (Vec<&Frame>, Vec<&Frame>) = frames
+        .iter()
+        .partition(|f| f.t[T::Submissions as usize] >= WORLD_SUBMISSIONS);
+    let sum = |v: &[&Frame]| v.iter().map(|f| f.us).sum::<f64>();
+    let (w, o) = (sum(&world), sum(&other));
+    format!(
+        "frames by kind: {} of the world ({WORLD_SUBMISSIONS:.0} or more host submissions) in {:.1} s: mean {:.0} ms, {:.2} a second while they ran; {} menu or loading frames (fewer submissions) in {:.1} s: mean {:.0} ms",
+        world.len(),
+        w / 1e6,
+        w / 1e3 / world.len().max(1) as f64,
+        world.len() as f64 * 1e6 / w.max(1.0),
+        other.len(),
+        o / 1e6,
+        o / 1e3 / other.len().max(1) as f64
+    )
 }
 
 #[cfg(test)]
@@ -605,7 +873,14 @@ mod tests {
     use super::*;
 
     fn frame(number: u64, ms: f64) -> Frame {
-        let mut f = Frame { number, at: number as f64, us: ms * 1e3, t: [0.0; N], s: [0.0; S], h: [0.0; HN] };
+        let mut f = Frame {
+            number,
+            at: number as f64,
+            us: ms * 1e3,
+            t: [0.0; N],
+            s: [0.0; S],
+            h: [0.0; HN],
+        };
         f.t[T::PresentUs as usize] = ms * 100.0;
         f.t[T::Uploads as usize] = ms;
         f
@@ -613,16 +888,28 @@ mod tests {
 
     #[test]
     fn a_long_frame_is_listed_beside_the_usual_one() {
-        let frames: Vec<Frame> = [150.0, 160.0, 140.0, 400.0, 150.0].iter().enumerate().map(|(i, &ms)| frame(i as u64, ms)).collect();
+        let frames: Vec<Frame> = [150.0, 160.0, 140.0, 400.0, 150.0]
+            .iter()
+            .enumerate()
+            .map(|(i, &ms)| frame(i as u64, ms))
+            .collect();
         let out = lines(&frames, 150_000.0, 1.0);
         assert_eq!(out.len(), 3, "{out:#?}");
         assert!(out[0].starts_with("frame times: 5 frames in 1.0 s: shortest 140 ms, median 150, longest 400; 1 long (over 225 ms"), "{}", out[0]);
         assert!(out[0].ends_with("each: 150 160 140 400 150"), "{}", out[0]);
         // The usual frame is the mean of the four that are not long.
-        assert!(out[1].starts_with("usual frame (the mean of 4 not long): 150 ms |"), "{}", out[1]);
+        assert!(
+            out[1].starts_with("usual frame (the mean of 4 not long): 150 ms |"),
+            "{}",
+            out[1]
+        );
         assert!(out[1].contains("in the present call 15.0 "), "{}", out[1]);
         assert!(out[1].contains(" 150 uploads"), "{}", out[1]);
-        assert!(out[2].starts_with("long frame 3 at 3.0 s: 400 ms |"), "{}", out[2]);
+        assert!(
+            out[2].starts_with("long frame 3 at 3.0 s: 400 ms |"),
+            "{}",
+            out[2]
+        );
         assert!(out[2].contains("in the present call 40.0 "), "{}", out[2]);
         assert!(out[2].contains(" 400 uploads"), "{}", out[2]);
     }
@@ -638,8 +925,14 @@ mod tests {
         let mut frames: Vec<Frame> = (0..12).map(|i| frame(i, 500.0)).collect();
         frames.push(frame(12, 100.0));
         let out = lines(&frames, 100_000.0, 5.0);
-        assert_eq!(out.iter().filter(|l| l.starts_with("long frame ")).count(), LONG_MOST);
-        assert!(out.last().unwrap().starts_with("long frames: 4 more"), "{out:#?}");
+        assert_eq!(
+            out.iter().filter(|l| l.starts_with("long frame ")).count(),
+            LONG_MOST
+        );
+        assert!(
+            out.last().unwrap().starts_with("long frames: 4 more"),
+            "{out:#?}"
+        );
     }
 
     #[test]

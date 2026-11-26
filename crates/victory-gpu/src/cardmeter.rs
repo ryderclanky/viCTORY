@@ -41,6 +41,9 @@ pub(crate) enum Kind {
     /// Inside one of those: from where a pipeline is bound to where the
     /// next one is, or the list ends ([`begin_named`]).
     Pipeline,
+    /// Inside one of those: the clamp of an indirect command, from before
+    /// its first barrier to after its second ([`clamp_begin`]; a sample).
+    Clamp,
 }
 
 /// Pairs of timestamps in the ring.
@@ -87,6 +90,14 @@ struct Meter {
     /// not written since (its list never ran) still holds that, and is
     /// not counted again.
     seen: Vec<(u64, u64)>,
+    /// Since the last line "the card per frame": where each whole list
+    /// began and ended, in ticks of the queue's clock ([`gaps_line`]).
+    spans: Vec<(u64, u64)>,
+    /// Frames since that line, and when it was last written.
+    gap_frames: u64,
+    gap_line: std::time::Instant,
+    /// Since that line: clamps timed and their microseconds ([`clamp_begin`]).
+    clamps: (u64, u64),
 }
 
 // SAFETY: host objects (free-threaded) and a mapping only read, behind a lock.
@@ -108,14 +119,20 @@ fn make() -> Option<Meter> {
     let device = host.device();
     let mut heap: Option<ID3D12QueryHeap> = None;
     let mut back: Option<ID3D12Resource> = None;
-    let readback = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
+    let readback = D3D12_HEAP_PROPERTIES {
+        Type: D3D12_HEAP_TYPE_READBACK,
+        ..Default::default()
+    };
     let desc = D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
         Width: u64::from(PAIRS) * 16,
         Height: 1,
         DepthOrArraySize: 1,
         MipLevels: 1,
-        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
         Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
         ..Default::default()
     };
@@ -123,12 +140,23 @@ fn make() -> Option<Meter> {
     unsafe {
         device
             .CreateQueryHeap(
-                &D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: PAIRS * 2, NodeMask: 0 },
+                &D3D12_QUERY_HEAP_DESC {
+                    Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP,
+                    Count: PAIRS * 2,
+                    NodeMask: 0,
+                },
                 &mut heap,
             )
             .ok()?;
         device
-            .CreateCommittedResource(&readback, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut back)
+            .CreateCommittedResource(
+                &readback,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                None,
+                &mut back,
+            )
             .ok()?;
         let (heap, back) = (heap?, back?);
         let mut mapped = std::ptr::null_mut();
@@ -152,6 +180,10 @@ fn make() -> Option<Meter> {
             by_pipeline: Default::default(),
             frames: 0,
             seen: vec![(0, 0); PAIRS as usize],
+            spans: Vec::new(),
+            gap_frames: 0,
+            gap_line: std::time::Instant::now(),
+            clamps: (0, 0),
         })
     }
 }
@@ -191,7 +223,14 @@ pub(crate) fn end(list: &ID3D12GraphicsCommandList, span: Span) {
     // own sixteen bytes of it.
     unsafe {
         list.EndQuery(&m.heap, D3D12_QUERY_TYPE_TIMESTAMP, span.0 * 2 + 1);
-        list.ResolveQueryData(&m.heap, D3D12_QUERY_TYPE_TIMESTAMP, span.0 * 2, 2, &m.back, u64::from(span.0) * 16);
+        list.ResolveQueryData(
+            &m.heap,
+            D3D12_QUERY_TYPE_TIMESTAMP,
+            span.0 * 2,
+            2,
+            &m.back,
+            u64::from(span.0) * 16,
+        );
     }
 }
 
@@ -200,7 +239,9 @@ pub(crate) fn end(list: &ID3D12GraphicsCommandList, span: Span) {
 /// more queries and a resolve at every change of pipeline).
 pub(crate) fn pipelines() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| on() && std::env::var_os("VICTORY_CARD_METER_PIPELINES").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| {
+        on() && std::env::var_os("VICTORY_CARD_METER_PIPELINES").is_some_and(|v| v == "1")
+    })
 }
 
 /// The pipeline `name` is bound on `list` here: the first timestamp of a
@@ -225,7 +266,11 @@ pub(crate) fn begin_named(list: &ID3D12GraphicsCommandList, name: &str) -> Span 
 /// passes the card's time goes to, in a run like any other (the timing run
 /// that names every command sends each list alone and needs the
 /// device-removed notes).
-pub(crate) fn end_named(list: &ID3D12GraphicsCommandList, span: Span, names: &std::collections::BTreeSet<String>) {
+pub(crate) fn end_named(
+    list: &ID3D12GraphicsCommandList,
+    span: Span,
+    names: &std::collections::BTreeSet<String>,
+) {
     if span.0 == u32::MAX {
         return;
     }
@@ -250,6 +295,42 @@ fn name_of(names: &std::collections::BTreeSet<String>) -> String {
     }
 }
 
+/// One clamp in how many is timed (`VICTORY_CARD_METER_CLAMPS=<n>`, 1 to
+/// 4096; unset or 0: none). Each timed clamp adds two timestamps and a
+/// resolve to the list, which the card writes when it gets there: they wait
+/// for nothing and change no command the title recorded. Risk-free, but a
+/// timestamp is itself a small point of order on some cards, so a sample.
+fn clamp_every() -> u64 {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        if !on() {
+            return 0;
+        }
+        std::env::var("VICTORY_CARD_METER_CLAMPS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(0, |n| n.min(4096))
+    })
+}
+
+/// Every clamp recorded since the line "the card per frame" ([`clamp_begin`]).
+static CLAMPS_ALL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// An indirect command's clamp begins here (`crate::indirect`, before its
+/// first barrier): the first timestamp of a pair if this clamp is one of
+/// the sample, else none. Every clamp is counted, to scale the sample.
+pub(crate) fn clamp_begin(list: &ID3D12GraphicsCommandList) -> Span {
+    let every = clamp_every();
+    if every == 0 {
+        return Span::NONE;
+    }
+    let n = CLAMPS_ALL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if !n.is_multiple_of(every) {
+        return Span::NONE;
+    }
+    begin(list, Kind::Clamp)
+}
+
 /// Microseconds between two timestamps of a clock of `frequency` ticks a
 /// second; 0 if the second is not after the first (a pair the card has not
 /// written, or a list that never ran).
@@ -258,6 +339,86 @@ fn micros(begin: u64, end: u64, frequency: u64) -> u64 {
         return 0;
     }
     ((end - begin) as u128 * 1_000_000 / frequency as u128).min(10_000_000) as u64
+}
+
+/// The line "the card per frame": of the direct queue's time by its own
+/// clock, how long a list of ours was running (the union of the lists'
+/// stamps) and how long none was, between one list's end and the next
+/// list's begin, by the length of the gap. The frame line's "card: idle"
+/// says how much of a frame had nothing of ours queued; what the gaps
+/// hold beyond that is the card standing with work of ours queued, which
+/// no line said (runs 293 to 300: 26 to 43 ms a frame). Short gaps are
+/// what the card pays between two lists; long ones are waits: for the
+/// title, for a present, for memory to be mapped under a texture, for
+/// another program's turn on the card. Diagnostics, every five seconds.
+fn gaps_line(m: &mut Meter) {
+    let frames = std::mem::take(&mut m.gap_frames).max(1) as f64;
+    let mut spans = std::mem::take(&mut m.spans);
+    if spans.len() < 2 || m.frequency == 0 {
+        return;
+    }
+    spans.sort_unstable();
+    let us = |ticks: u64| (ticks as u128 * 1_000_000 / m.frequency as u128) as u64;
+    // Gaps under 0.1 ms, to 2 ms, to 20 ms, and longer: how many, and
+    // their microseconds.
+    let mut gaps = [(0u64, 0u64); 4];
+    let (mut running, mut summed) = (0u64, 0u64);
+    let mut reached = spans[0].0;
+    for &(begin, end) in &spans {
+        summed += us(end - begin);
+        if begin > reached {
+            let gap = us(begin - reached);
+            let class = match gap {
+                0..100 => 0,
+                100..2_000 => 1,
+                2_000..20_000 => 2,
+                _ => 3,
+            };
+            gaps[class].0 += 1;
+            gaps[class].1 += gap;
+            reached = begin;
+        }
+        if end > reached {
+            running += us(end - reached);
+            reached = end;
+        }
+    }
+    let ms = |us: u64| us as f64 / 1e3 / frames;
+    // The clamps of indirect commands, from the sample ([`clamp_begin`]):
+    // before its first barrier to after its second, which holds the card's
+    // waits for every earlier shader write on both sides of the clamp.
+    let (timed, timed_us) = std::mem::take(&mut m.clamps);
+    let all = CLAMPS_ALL.swap(0, std::sync::atomic::Ordering::Relaxed);
+    if timed > 0 {
+        let each = timed_us as f64 / timed as f64;
+        tracing::info!(
+            "the clamps of indirect commands per frame (one in {} timed, VICTORY_CARD_METER_CLAMPS): {:.0} clamps, {:.0} timed, \
+             {:.1} us each from before the first barrier to after the second, so about {:.1} ms a frame for all of them",
+            clamp_every(),
+            all as f64 / frames,
+            timed as f64 / frames,
+            each,
+            each * all as f64 / 1e3 / frames
+        );
+    }
+    tracing::info!(
+        "the card per frame ({frames:.0} frames, the direct queue by its own clock): a list of ours running {:.1} ms (the lists' \
+         stamps add to {:.1} ms; {:.0} lists); no list running between one list's end and the next one's begin: {:.1} ms in \
+         {:.0} gaps under 0.1 ms, {:.1} ms in {:.0} gaps of 0.1 to 2 ms, {:.1} ms in {:.0} gaps of 2 to 20 ms, {:.1} ms in \
+         {:.0} gaps over 20 ms (of the gaps' time, the frame line's \"card: idle\" had nothing of ours queued; the rest is the \
+         card standing with work of ours queued)",
+        ms(running),
+        ms(summed),
+        spans.len() as f64 / frames,
+        ms(gaps[0].1),
+        gaps[0].0 as f64 / frames,
+        ms(gaps[1].1),
+        gaps[1].0 as f64 / frames,
+        ms(gaps[2].1),
+        gaps[2].0 as f64 / frames,
+        ms(gaps[3].1),
+        gaps[3].0 as f64 / frames,
+    );
 }
 
 /// The pairs recorded long enough ago are read and added to the frame
@@ -286,6 +447,11 @@ pub(crate) fn collect() {
             continue;
         }
         let us = micros(begin, end, m.frequency);
+        // A whole list (not a pipeline's stretch inside one), run by the
+        // card: for the gaps between lists.
+        if !matches!(kind, Kind::Pipeline | Kind::Clamp) && begin != 0 && end > begin {
+            m.spans.push((begin, end));
+        }
         use crate::framelog::{T, add};
         match kind {
             Kind::Sync => {
@@ -312,7 +478,19 @@ pub(crate) fn collect() {
                     e.1 += us;
                 }
             }
+            Kind::Clamp => {
+                // A pair the card wrote (a list that ran): counted.
+                if us > 0 {
+                    m.clamps.0 += 1;
+                    m.clamps.1 += us;
+                }
+            }
         }
+    }
+    m.gap_frames += 1;
+    if now.duration_since(m.gap_line) >= std::time::Duration::from_secs(5) {
+        gaps_line(m);
+        m.gap_line = now;
     }
     m.frames += 1;
     if m.frames >= 256 {
@@ -328,7 +506,11 @@ pub(crate) fn collect() {
             table.len()
         );
         for (name, (n, us)) in table.into_iter().take(24) {
-            tracing::info!("  card {:6.2} ms a frame in {:5.1} lists: {name}", us as f64 / 1e3 / frames, n as f64 / frames);
+            tracing::info!(
+                "  card {:6.2} ms a frame in {:5.1} lists: {name}",
+                us as f64 / 1e3 / frames,
+                n as f64 / frames
+            );
         }
         if !m.by_pipeline.is_empty() {
             let mut table: Vec<(String, (u64, u64))> = m.by_pipeline.drain().collect();
@@ -366,7 +548,10 @@ mod tests {
         assert_eq!(name_of(&names), "1 pipeline: compute CS_Blur");
         names.insert("mesh VS_A, pixel PS_B".to_string());
         names.insert("a".repeat(100));
-        assert_eq!(name_of(&names), format!("3 pipelines: {} / compute CS_Blur", "a".repeat(60)));
+        assert_eq!(
+            name_of(&names),
+            format!("3 pipelines: {} / compute CS_Blur", "a".repeat(60))
+        );
     }
 
     #[test]

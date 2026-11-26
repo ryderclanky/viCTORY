@@ -133,8 +133,33 @@ pub(crate) enum C {
     /// `watch::writes` askings not made because the range's first block is
     /// already known to be guarded view memory (no kernel call).
     WatchKnownView,
+    /// Microseconds of the `watch::writes` askings whose kernel call failed
+    /// and fell to the guards: the failed call, the look at what the
+    /// memory is, the guards' walk.
+    WatchFailedUs,
+    /// Microseconds of the askings answered by the guards with no kernel
+    /// call (`WatchKnownView`).
+    WatchKnownUs,
+    /// Refreshes of a watched host copy's range (`Shadow::update_free`)
+    /// that copied nothing, and their microseconds (the asking included).
+    RefreshNone,
+    RefreshNoneUs,
+    /// The ones that copied something, and their microseconds.
+    RefreshSome,
+    RefreshSomeUs,
+    /// With `VICTORY_REFRESH_COUNT=1`: of the refreshes that copied
+    /// nothing, those known unchanged before asking
+    /// (`crate::watch::unchanged_known`), and their microseconds: what a
+    /// skip of them would take off at most.
+    RefreshKnown,
+    RefreshKnownUs,
+    /// Refreshes skipped as known unchanged (`VICTORY_REGION_SKIP`).
+    RefreshSkipped,
 }
-const COUNTERS: usize = 80;
+/// One slot per counter: follows the enum (a fixed 80 was outrun by the
+/// refresh counters and ended run 324 with an index past the end).
+const COUNTERS: usize = C::RefreshSkipped as usize + 1;
+const _: () = assert!(COUNTERS <= 256, "the counters' array stays small");
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -164,7 +189,10 @@ static WHOLE: Mutex<Option<HashMap<(usize, usize), (u64, u64)>>> = Mutex::new(No
 pub(crate) fn whole(src: usize, len: usize, us: u64) {
     add(C::WholeUs, us);
     let mut map = WHOLE.lock().unwrap_or_else(|e| e.into_inner());
-    let e = map.get_or_insert_with(HashMap::new).entry((src, len)).or_insert((0, 0));
+    let e = map
+        .get_or_insert_with(HashMap::new)
+        .entry((src, len))
+        .or_insert((0, 0));
     e.0 += 1;
     e.1 += us;
 }
@@ -187,7 +215,10 @@ static COMMANDS_BY_WORK: Mutex<Option<HashMap<String, (u64, u64, u64)>>> = Mutex
 pub(crate) fn command_took(op: &str, ms: f64) {
     let us = (ms * 1e3) as u64;
     let mut by = COMMANDS_BY_WORK.lock().unwrap_or_else(|e| e.into_inner());
-    let e = by.get_or_insert_with(HashMap::new).entry(command_key(op)).or_insert((0, 0, 0));
+    let e = by
+        .get_or_insert_with(HashMap::new)
+        .entry(command_key(op))
+        .or_insert((0, 0, 0));
     e.0 += 1;
     e.1 += us;
     e.2 = e.2.max(us);
@@ -222,7 +253,10 @@ pub(crate) fn card_waited(us: u64, what: impl FnOnce() -> String) {
     let text = what();
     {
         let mut by = WAITS_BY_WORK.lock().unwrap_or_else(|e| e.into_inner());
-        let e = by.get_or_insert_with(HashMap::new).entry(text.clone()).or_insert((0, 0));
+        let e = by
+            .get_or_insert_with(HashMap::new)
+            .entry(text.clone())
+            .or_insert((0, 0));
         e.0 += 1;
         e.1 += us;
     }
@@ -256,7 +290,10 @@ static COMPARED: Mutex<Option<HashMap<(usize, usize), (u64, u64)>>> = Mutex::new
 /// them put back into title memory.
 pub(crate) fn compared(src: usize, len: usize, written: usize) {
     let mut map = COMPARED.lock().unwrap_or_else(|e| e.into_inner());
-    let e = map.get_or_insert_with(HashMap::new).entry((src, len)).or_insert((0, 0));
+    let e = map
+        .get_or_insert_with(HashMap::new)
+        .entry((src, len))
+        .or_insert((0, 0));
     e.0 += 1;
     e.1 += written as u64;
 }
@@ -309,7 +346,8 @@ fn own(size: usize, made: bool) {
 /// by size without saying whose they are (run 65: one of 544 MB, one of
 /// 401 MB, two of 174 MB, two of 115 MB); the sizes here say which of them
 /// are ours.
-static BIG_AT: [std::sync::atomic::AtomicUsize; 64] = [const { std::sync::atomic::AtomicUsize::new(0) }; 64];
+static BIG_AT: [std::sync::atomic::AtomicUsize; 64] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 64];
 static BIG_BYTES: [AtomicU64; 64] = [const { AtomicU64::new(0) }; 64];
 const BIG: usize = 32 << 20;
 
@@ -320,7 +358,10 @@ fn big(at: *mut u8, size: usize, made: bool) {
     }
     for (place, bytes) in BIG_AT.iter().zip(&BIG_BYTES) {
         if made {
-            if place.compare_exchange(0, at as usize, Relaxed, Relaxed).is_ok() {
+            if place
+                .compare_exchange(0, at as usize, Relaxed, Relaxed)
+                .is_ok()
+            {
                 bytes.store(size as u64, Relaxed);
                 return;
             }
@@ -334,10 +375,21 @@ fn big(at: *mut u8, size: usize, made: bool) {
 
 /// The sizes of our own big blocks alive, largest first, in MB.
 fn big_blocks() -> String {
-    let mut sizes: Vec<u64> = BIG_BYTES.iter().map(|b| b.load(Relaxed)).filter(|&b| b != 0).collect();
+    let mut sizes: Vec<u64> = BIG_BYTES
+        .iter()
+        .map(|b| b.load(Relaxed))
+        .filter(|&b| b != 0)
+        .collect();
     sizes.sort_unstable_by(|a, b| b.cmp(a));
-    let text: Vec<String> = sizes.iter().map(|b| format!("{:.2}", *b as f64 / (1 << 20) as f64)).collect();
-    if text.is_empty() { "none".into() } else { text.join(", ") }
+    let text: Vec<String> = sizes
+        .iter()
+        .map(|b| format!("{:.2}", *b as f64 / (1 << 20) as f64))
+        .collect();
+    if text.is_empty() {
+        "none".into()
+    } else {
+        text.join(", ")
+    }
 }
 
 /// The system's allocator with every block counted in [`OWN`] (two atomic
@@ -398,15 +450,40 @@ mod command_tests {
     fn commands_are_named_by_their_pipeline() {
         use super::command_key;
         assert_eq!(
-            command_key("dispatch 182x1x1 [compute 24f989b98dcb03f0] | 24f989b98dcb03f0: u4=0xa6b080 [heap 341380: x]"),
+            command_key(
+                "dispatch 182x1x1 [compute 24f989b98dcb03f0] | 24f989b98dcb03f0: u4=0xa6b080 [heap 341380: x]"
+            ),
             "dispatch [compute 24f989b98dcb03f0]"
         );
         assert_eq!(
-            command_key("indirect kind 10 max 1 at 0xd9358fce0 [mesh 0750cb2d975c7563, pixel 085d374c5a795549] | t"),
+            command_key(
+                "indirect kind 10 max 1 at 0xd9358fce0 [mesh 0750cb2d975c7563, pixel 085d374c5a795549] | t"
+            ),
             "indirect [mesh 0750cb2d975c7563, pixel 085d374c5a795549]"
         );
-        assert_eq!(command_key("texture upload 0x271b61c28b0 (2048x2048x1 f99 mips 10) sub 0"), "texture upload");
-        assert_eq!(command_key("alias copy of 0x26f66aca780 into 0x26fbdc93890"), "alias copy");
+        assert_eq!(
+            command_key("texture upload 0x271b61c28b0 (2048x2048x1 f99 mips 10) sub 0"),
+            "texture upload"
+        );
+        assert_eq!(
+            command_key("alias copy of 0x26f66aca780 into 0x26fbdc93890"),
+            "alias copy"
+        );
+    }
+}
+
+#[cfg(test)]
+mod counter_tests {
+    /// Every counter has a slot: the last one too (run 324 ended with an
+    /// index past the end of a fixed-size array).
+    #[test]
+    fn the_last_counter_has_a_slot() {
+        use super::{C, COUNT, add};
+        use std::sync::atomic::Ordering::Relaxed;
+        let before = COUNT[C::RefreshSkipped as usize].load(Relaxed);
+        add(C::RefreshSkipped, 1);
+        add(C::RefreshKnownUs, 0);
+        assert!(COUNT[C::RefreshSkipped as usize].load(Relaxed) > before);
     }
 }
 
@@ -434,7 +511,9 @@ mod own_tests {
             super::BIG_AT
                 .iter()
                 .zip(&super::BIG_BYTES)
-                .any(|(place, bytes)| place.load(Relaxed) == at && bytes.load(Relaxed) == size as u64)
+                .any(|(place, bytes)| {
+                    place.load(Relaxed) == at && bytes.load(Relaxed) == size as u64
+                })
         };
         let block = vec![0u8; size];
         let at = block.as_ptr() as usize;
@@ -501,7 +580,11 @@ fn in_memory(asked: &mut Vec<[usize; 2]>, stands: &mut Vec<(usize, u64)>, presen
     // SAFETY: our own process; `asked` holds that many entries of two
     // words each, as the call fills them in.
     let ok = unsafe {
-        K32QueryWorkingSetEx(GetCurrentProcess(), asked.as_mut_ptr().cast(), (asked.len() * 16) as u32)
+        K32QueryWorkingSetEx(
+            GetCurrentProcess(),
+            asked.as_mut_ptr().cast(),
+            (asked.len() * 16) as u32,
+        )
     } != 0;
     if ok {
         for (a, &(kind, bytes)) in asked.iter().zip(stands.iter()) {
@@ -630,7 +713,14 @@ fn log_memory_map() {
     }
     let text: Vec<String> = (0..KINDS.len())
         .filter(|&k| committed[k] > 0)
-        .map(|k| format!("{} {} MB ({} MB in memory)", KINDS[k], committed[k] >> 20, present[k] >> 20))
+        .map(|k| {
+            format!(
+                "{} {} MB ({} MB in memory)",
+                KINDS[k],
+                committed[k] >> 20,
+                present[k] >> 20
+            )
+        })
         .collect();
     tracing::info!(
         "memory map ({} regions, {} ms): {}",
@@ -652,7 +742,9 @@ fn log_memory_map() {
     }
     let mut groups: HashMap<(usize, usize), (u64, u64)> = HashMap::new();
     for (base, &(k, bytes)) in &by_allocation {
-        let group = groups.entry((k, whole.get(base).copied().unwrap_or(0))).or_default();
+        let group = groups
+            .entry((k, whole.get(base).copied().unwrap_or(0)))
+            .or_default();
         group.0 += 1;
         group.1 += bytes;
     }
@@ -692,7 +784,10 @@ fn log_memory() {
     let windows = crate::shadow::windows();
     let stagings = crate::texture::let_go();
     let census = crate::resource::census();
-    let kinds: Vec<u64> = crate::resource::KINDS.iter().map(|k| k.load(Relaxed)).collect();
+    let kinds: Vec<u64> = crate::resource::KINDS
+        .iter()
+        .map(|k| k.load(Relaxed))
+        .collect();
     let card = crate::host::host()
         .and_then(|h| h.video_memory())
         .unwrap_or_default();
@@ -706,10 +801,12 @@ fn log_memory() {
     static LINES: AtomicU64 = AtomicU64::new(0);
     static WALKING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if memory_map() && LINES.fetch_add(1, Relaxed) % 6 == 5 && !WALKING.swap(true, Relaxed) {
-        let walk = std::thread::Builder::new().name("victory-memory-map".into()).spawn(|| {
-            log_memory_map();
-            WALKING.store(false, Relaxed);
-        });
+        let walk = std::thread::Builder::new()
+            .name("victory-memory-map".into())
+            .spawn(|| {
+                log_memory_map();
+                WALKING.store(false, Relaxed);
+            });
         if walk.is_err() {
             WALKING.store(false, Relaxed);
         }
@@ -749,6 +846,17 @@ fn log_memory() {
         mb(card[0]),
         mb(card[3]),
     );
+    // Upstream VIctory #3198: textures the card had no room for are asked
+    // for again instead of staying without a host copy for the run.
+    let no_room = crate::resource::NOT_MADE_FOR_NOW.load(Relaxed);
+    if no_room > 0 {
+        tracing::info!(
+            "host textures the card had no room for when asked: {} times since the start, {} of them \
+             made on a later use",
+            no_room,
+            crate::resource::MADE_AFTER_NO_ROOM.load(Relaxed),
+        );
+    }
     let targets = crate::resource::targets_census();
     tracing::info!(
         "host copies the sweep never lets go: {} the host renders to or writes {:.0} MB ({} of them placed {:.0} MB);          of them {} have title memory that is not mapped now {:.0} MB, {} were not used for 30 s and are held by no          list and no slot {:.0} MB, {} are both {:.0} MB; and {} copies of textures the title fills that the host          copied into {:.0} MB",
@@ -892,7 +1000,10 @@ fn log_memory() {
 /// Microseconds since the first call.
 fn now_us() -> u64 {
     static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    EPOCH.get_or_init(std::time::Instant::now).elapsed().as_micros() as u64
+    EPOCH
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_micros() as u64
 }
 
 /// When the last frame was presented and when the last submission returned
@@ -950,10 +1061,21 @@ fn micros(t: windows_sys::Win32::Foundation::FILETIME) -> u64 {
 fn thread_times() -> (u64, u64) {
     use windows_sys::Win32::Foundation::FILETIME;
     use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
-    let zero = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+    let zero = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
     let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
     // SAFETY: our own thread and four valid out pointers.
-    unsafe { GetThreadTimes(GetCurrentThread(), &mut created, &mut exited, &mut kernel, &mut user) };
+    unsafe {
+        GetThreadTimes(
+            GetCurrentThread(),
+            &mut created,
+            &mut exited,
+            &mut kernel,
+            &mut user,
+        )
+    };
     (micros(user), micros(kernel))
 }
 
@@ -961,10 +1083,21 @@ fn thread_times() -> (u64, u64) {
 fn process_times() -> (u64, u64) {
     use windows_sys::Win32::Foundation::FILETIME;
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
-    let zero = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+    let zero = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
     let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
     // SAFETY: our own process and four valid out pointers.
-    unsafe { GetProcessTimes(GetCurrentProcess(), &mut created, &mut exited, &mut kernel, &mut user) };
+    unsafe {
+        GetProcessTimes(
+            GetCurrentProcess(),
+            &mut created,
+            &mut exited,
+            &mut kernel,
+            &mut user,
+        )
+    };
     (micros(user), micros(kernel))
 }
 
@@ -989,7 +1122,10 @@ pub(crate) fn recorded(started: std::time::Instant) {
     crate::framelog::here(crate::framelog::H::RecordNs, ns);
     if !RECORDED_SINCE.load(Relaxed) && !RECORDED_SINCE.swap(true, Relaxed) {
         let began = now_us().saturating_sub(ns / 1000);
-        add(C::UntilRecordUs, began.saturating_sub(PRESENTED_AT.load(Relaxed)));
+        add(
+            C::UntilRecordUs,
+            began.saturating_sub(PRESENTED_AT.load(Relaxed)),
+        );
     }
     OURS.with(|o| o.set(o.get() + ns));
     let (unsent, calls) = UNSENT.with(|u| u.get());
@@ -1019,7 +1155,10 @@ pub(crate) fn recorded(started: std::time::Instant) {
 pub(crate) fn submission_begins() {
     let now = now_us();
     if !SUBMITTED_SINCE.load(Relaxed) && !SUBMITTED_SINCE.swap(true, Relaxed) {
-        add(C::UntilSubmitUs, now.saturating_sub(PRESENTED_AT.load(Relaxed)));
+        add(
+            C::UntilSubmitUs,
+            now.saturating_sub(PRESENTED_AT.load(Relaxed)),
+        );
     }
     let (user, kernel) = thread_times();
     ENTERED.with(|e| e.set((user, kernel)));
@@ -1053,7 +1192,10 @@ pub(crate) fn submission_ends(lock: u64) {
 
 /// The title calls its present (before our own copy to the window runs).
 pub(crate) fn present_begins() {
-    add(C::TailUs, now_us().saturating_sub(SUBMITTED_AT.load(Relaxed)));
+    add(
+        C::TailUs,
+        now_us().saturating_sub(SUBMITTED_AT.load(Relaxed)),
+    );
 }
 
 /// A frame was presented.
@@ -1152,6 +1294,7 @@ pub(crate) fn log(frames: f64) {
         c[C::GpuWritesLeftOut as usize],
         mb(c[C::GpuWritesLeftOutBytes as usize]),
     );
+    crate::draw::tables_line(frames);
     let [together, written, mapped] =
         [0, 1, 2].map(|n| crate::watch::ALIASES[n].load(std::sync::atomic::Ordering::Relaxed));
     tracing::info!(
@@ -1233,7 +1376,10 @@ pub(crate) fn log(frames: f64) {
         longest.0 as f64 / 1e3,
         longest.1
     );
-    let by = WAITS_BY_WORK.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let by = WAITS_BY_WORK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
     let mut by: Vec<_> = by.into_iter().flatten().collect();
     by.sort_by_key(|&(_, (_, us))| std::cmp::Reverse(us));
     for (what, (n, us)) in by.into_iter().take(12) {
@@ -1244,7 +1390,10 @@ pub(crate) fn log(frames: f64) {
             what.chars().take(700).collect::<String>()
         );
     }
-    let by = COMMANDS_BY_WORK.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let by = COMMANDS_BY_WORK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
     let mut by: Vec<_> = by.into_iter().flatten().collect();
     by.sort_by_key(|&(_, (_, us, _))| std::cmp::Reverse(us));
     // All of them together, and by their first word: the forty lines below
@@ -1262,8 +1411,16 @@ pub(crate) fn log(frames: f64) {
         }
         kinds.sort_by_key(|k| std::cmp::Reverse(k.2));
         let all: u64 = kinds.iter().map(|k| k.2).sum();
-        let text: Vec<String> =
-            kinds.iter().map(|(word, n, us)| format!("{word} {:.1} ms in {:.0}", *us as f64 / 1e3 / frames, *n as f64 / frames)).collect();
+        let text: Vec<String> = kinds
+            .iter()
+            .map(|(word, n, us)| {
+                format!(
+                    "{word} {:.1} ms in {:.0}",
+                    *us as f64 / 1e3 / frames,
+                    *n as f64 / frames
+                )
+            })
+            .collect();
         tracing::info!(
             "  the card's time by command (timing run), all {} kinds together: {:.1} ms a frame; by first word: {}",
             by.len(),
@@ -1280,12 +1437,29 @@ pub(crate) fn log(frames: f64) {
         );
     }
     tracing::info!(
-        "  write-watch askings per frame that failed in the kernel: {:.0}; not made because the range \
-         is known guarded view memory: {:.0} (VICTORY_VIEW_ASK=1 asks the kernel anyway); such ranges left \
+        "  write-watch askings per frame that failed in the kernel: {:.0} ({:.2} ms in all with their guard walks); \
+         not made because the range is known guarded view memory: {:.0} ({:.2} ms in all) (VICTORY_VIEW_ASK=1 asks \
+         the kernel anyway; VICTORY_VIEW_KNOWN=1 keeps written view blocks known); such ranges left \
          out of the submissions' askings ahead: {:.0}",
         c[C::WatchFailed as usize],
+        c[C::WatchFailedUs as usize] / 1e3,
         c[C::WatchKnownView as usize],
+        c[C::WatchKnownUs as usize] / 1e3,
         crate::watch::AHEAD_VIEWS.swap(0, Relaxed) as f64 / frames,
+    );
+    tracing::info!(
+        "  refreshes of watched host copies per frame: {:.0} copied nothing ({:.2} ms), {:.0} copied something \
+         ({:.2} ms); of those that copied nothing, {:.0} were known unchanged before asking ({:.2} ms; \
+         VICTORY_REFRESH_COUNT=1 looks: every block of the range read-only by our hand and clean, or the range \
+         asked ahead, and no page noted written since the copy took it); skipped as known unchanged \
+         (VICTORY_REGION_SKIP): {:.0}",
+        c[C::RefreshNone as usize],
+        c[C::RefreshNoneUs as usize] / 1e3,
+        c[C::RefreshSome as usize],
+        c[C::RefreshSomeUs as usize] / 1e3,
+        c[C::RefreshKnown as usize],
+        c[C::RefreshKnownUs as usize] / 1e3,
+        c[C::RefreshSkipped as usize],
     );
     crate::draw::window_line(frames);
     tracing::info!(
@@ -1302,7 +1476,10 @@ pub(crate) fn log(frames: f64) {
     let compared = COMPARED.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut compared: Vec<_> = compared.into_iter().flatten().collect();
     compared.sort_by_key(|&((_, len), (n, _))| std::cmp::Reverse(len as u64 * n));
-    tracing::info!("  compared after submissions: {} ranges; the largest follow", compared.len());
+    tracing::info!(
+        "  compared after submissions: {} ranges; the largest follow",
+        compared.len()
+    );
     for ((src, len), (n, written)) in compared.into_iter().take(8) {
         tracing::info!(
             "  compared {src:#x}+{len:#x}: {:.1}x/frame, {:.2} MB/frame, {:.3} MB/frame of it written back",
@@ -1334,9 +1511,20 @@ pub(crate) fn log(frames: f64) {
     let busiest: Vec<String> = recorders
         .iter()
         .take(6)
-        .map(|r| format!("thread {} {:.0} ms in {:.0} calls", r.0, r.1 as f64 / 1e6 / frames, r.2 as f64 / frames))
+        .map(|r| {
+            format!(
+                "thread {} {:.0} ms in {:.0} calls",
+                r.0,
+                r.1 as f64 / 1e6 / frames,
+                r.2 as f64 / frames
+            )
+        })
         .collect();
-    tracing::info!("  list calls by thread: {} threads; {}", recorders.len(), busiest.join(", "));
+    tracing::info!(
+        "  list calls by thread: {} threads; {}",
+        recorders.len(),
+        busiest.join(", ")
+    );
     log_memory();
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();

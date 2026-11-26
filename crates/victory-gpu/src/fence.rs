@@ -95,7 +95,12 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
         return S_OK;
     }
     #[cfg(all(windows, feature = "diagnostics"))]
-    pace::waits(this, &fence.asked, value, fence.value.load(Ordering::Acquire));
+    pace::waits(
+        this,
+        &fence.asked,
+        value,
+        fence.value.load(Ordering::Acquire),
+    );
     if event.is_null() {
         // With submissions sent to the card and not waited for
         // (`crate::host::late`) the signal may be behind them: they are
@@ -188,7 +193,9 @@ pub(crate) mod pace {
     /// minutes of the wall clock, the same seconds in which the loader says
     /// the title's `mwaitx` waits (`console_insn`), to lay the two side by side.
     fn detail_now() -> bool {
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).is_ok_and(|d| d.as_secs() % 120 < 4)
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .is_ok_and(|d| d.as_secs() % 120 < 4)
     }
 
     fn thread() -> u32 {
@@ -211,12 +218,21 @@ pub(crate) mod pace {
         if detail_now() || SAID.fetch_add(1, Ordering::Relaxed) < 48 {
             tracing::info!(
                 "pace: the title waits for fence {fence:?} value {value} (it is at {now}) in frame {frame}, on {}",
-                if render { "the render thread".to_string() } else { format!("thread {thread}") }
+                if render {
+                    "the render thread".to_string()
+                } else {
+                    format!("thread {thread}")
+                }
             );
         }
         let mut asked = asked.lock().unwrap_or_else(|e| e.into_inner());
         if asked.len() < 4096 {
-            asked.push(Asked { value, at: Instant::now(), frame, thread });
+            asked.push(Asked {
+                value,
+                at: Instant::now(),
+                frame,
+                thread,
+            });
         }
     }
 
@@ -283,7 +299,10 @@ pub(crate) mod pace {
             return;
         }
         LINE_AT.store(frame, Ordering::Relaxed);
-        let n: Vec<f64> = N.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64).collect();
+        let n: Vec<f64> = N
+            .iter()
+            .map(|n| n.swap(0, Ordering::Relaxed) as f64)
+            .collect();
         let frames = (frame - last).max(1) as f64;
         let per = |a: f64, b: f64| if b > 0.0 { a / b } else { 0.0 };
         tracing::info!(
