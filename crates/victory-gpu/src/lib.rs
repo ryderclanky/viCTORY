@@ -74,7 +74,7 @@ pub mod resource;
 pub mod root;
 #[cfg(windows)]
 mod sampler;
-#[cfg(windows)]
+#[cfg_attr(not(windows), allow(dead_code))]
 pub mod shader_cache;
 #[cfg(windows)]
 mod shadow;

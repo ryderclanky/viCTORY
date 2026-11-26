@@ -110,6 +110,11 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::census;
 pub use lower::set_host_max_wave;
+
+/// The widest wave the host GPU runs (0 until the device says).
+pub fn host_wave_lanes() -> u32 {
+    lower::host_max_wave()
+}
 pub use rect::rect_list_gs;
 pub use sampler::StaticSampler;
 pub use shader::{
@@ -224,34 +229,129 @@ pub fn bvh_empty() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_EMPTY").is_some_and(|v| v == "1"))
 }
 
-/// Everything a translation depends on besides the container: the
-/// translator's own source (hashed at build time), the value of every
-/// `VICTORY_*` switch it reads, the host facts the device hands it (widest
-/// wave, view heap limit) and the settings above. The shader cache keys on
-/// this instead of on the whole executable, so a rebuild that leaves the
-/// translator alone keeps its translations. Call it after the device is made.
-pub fn translation_fingerprint() -> Vec<u8> {
-    let mut out = Vec::new();
+/// `VICTORY_WAVE_LOCAL`: `0` off, `idiom` only the exact allocation idiom,
+/// anything else (including unset) on.
+fn wave_local() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var_os("VICTORY_WAVE_LOCAL") {
+        Some(v) if v == "0" => 0,
+        Some(v) if v == "idiom" => 2,
+        _ => 1,
+    })
+}
+
+/// `VICTORY_WAVE_WIDE`: `0` off, `1` the barrier form is allowed, `last` only
+/// after the other forms, anything else (including unset) keeps the lane-mask
+/// widen and not the barrier form.
+fn wave_wide() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var_os("VICTORY_WAVE_WIDE") {
+        Some(v) if v == "0" => 0,
+        Some(v) if v == "1" => 1,
+        Some(v) if v == "last" => 2,
+        _ => 3,
+    })
+}
+
+/// `VICTORY_WAVE_DEEP_SKIPS=0` leaves deep skip removal off. Anything else is on.
+fn deep_skips() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0"))
+}
+
+/// The host facts a translation was made with. Part of [`translation_fingerprint`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TranslationFacts {
+    pub wave: u32,
+    pub view_null: u32,
+    pub loop_limit: u32,
+    pub group_sync: u8,
+    pub shader_opt: u32,
+    pub dispatch_split: bool,
+    pub bvh_empty: bool,
+    pub bvh_no_hit: bool,
+    pub f16_nearest: bool,
+    pub own_bits: bool,
+    pub first_half: bool,
+    pub strict_joins: bool,
+    pub coherent_mem: bool,
+    pub mesh_strict: bool,
+    pub firstlane_own: bool,
+    /// 0 off, 1 on, 2 idiom only.
+    pub wave_local: u8,
+    /// 0 off, 1 forced, 2 last, 3 default (lane-mask widen only).
+    pub wave_wide: u8,
+    pub deep_skips: bool,
+}
+
+impl TranslationFacts {
+    /// The facts this process will translate with. Switch values are the ones
+    /// the translator itself caches on first use, not the raw environment, so
+    /// a diagnostics path or a laptop memory switch cannot change them.
+    pub fn current() -> Self {
+        Self {
+            wave: lower::host_max_wave(),
+            view_null: shader::view_heap_limit(),
+            loop_limit: loop_limit(),
+            group_sync: group_sync(),
+            shader_opt: shader_opt(),
+            dispatch_split: dispatch_split(),
+            bvh_empty: bvh_empty(),
+            bvh_no_hit: lower::bvh_no_hit(),
+            f16_nearest: lower::f16_nearest_on(),
+            own_bits: lower::own_bits_on(),
+            first_half: lower::first_half_on(),
+            strict_joins: lower::strict_joins_on(),
+            coherent_mem: shader::coherent_mem_on(),
+            mesh_strict: lower::mesh_output_strict(),
+            firstlane_own: lower::firstlane_own(),
+            wave_local: wave_local(),
+            wave_wide: wave_wide(),
+            deep_skips: deep_skips(),
+        }
+    }
+}
+
+/// Bytes the shader cache mixes into its key for `facts`. Fixed layout: two
+/// processes with the same translator and the same facts produce the same
+/// bytes. Diagnostic switches (`VICTORY_SHADER_CENSUS`, `VICTORY_DXIL`,
+/// `VICTORY_D3D12_DEBUG`, …) and GPU memory switches (`VICTORY_PROFILE`,
+/// `VICTORY_TEXTURE_DROP_MIPS`, `VICTORY_AMBIENT`, …) are not inputs.
+pub fn fingerprint_of(facts: &TranslationFacts) -> Vec<u8> {
+    let mut out = Vec::with_capacity(64);
+    out.extend_from_slice(b"tf3");
     out.extend_from_slice(env!("VICTORY_SHADER_SOURCE_HASH").as_bytes());
     out.push(u8::from(cfg!(feature = "diagnostics")));
     out.push(u8::from(cfg!(debug_assertions)));
-    for name in env!("VICTORY_SHADER_SWITCHES")
-        .split(',')
-        .filter(|n| !n.is_empty())
-    {
-        out.extend_from_slice(name.as_bytes());
-        out.push(b'=');
-        if let Some(value) = std::env::var_os(name) {
-            out.extend_from_slice(value.as_encoded_bytes());
-        }
-        out.push(0);
-    }
-    out.extend_from_slice(&lower::host_max_wave().to_le_bytes());
-    out.extend_from_slice(&shader::view_heap_limit().to_le_bytes());
-    out.extend_from_slice(&loop_limit().to_le_bytes());
-    out.push(group_sync());
-    out.extend_from_slice(&shader_opt().to_le_bytes());
+    out.extend_from_slice(&facts.loop_limit.to_le_bytes());
+    out.push(facts.group_sync);
+    out.extend_from_slice(&facts.shader_opt.to_le_bytes());
+    out.push(u8::from(facts.dispatch_split));
+    out.push(u8::from(facts.bvh_empty));
+    out.push(u8::from(facts.bvh_no_hit));
+    out.push(u8::from(facts.f16_nearest));
+    out.push(u8::from(facts.own_bits));
+    out.push(u8::from(facts.first_half));
+    out.push(u8::from(facts.strict_joins));
+    out.push(u8::from(facts.coherent_mem));
+    out.push(u8::from(facts.mesh_strict));
+    out.push(u8::from(facts.firstlane_own));
+    out.push(facts.wave_local);
+    out.push(facts.wave_wide);
+    out.push(u8::from(facts.deep_skips));
+    out.extend_from_slice(&facts.wave.to_le_bytes());
+    out.extend_from_slice(&facts.view_null.to_le_bytes());
     out
+}
+
+/// Everything a translation depends on besides the container: the
+/// translator's own source (hashed at build time), the parsed value of every
+/// switch that changes the DXIL, and the host facts the device hands it
+/// (widest wave, view heap limit). The shader cache keys on this instead of
+/// on the whole executable, so a rebuild that leaves the translator alone
+/// keeps its translations. Call it after the device is made.
+pub fn translation_fingerprint() -> Vec<u8> {
+    fingerprint_of(&TranslationFacts::current())
 }
 
 /// `VICTORY_SHADER_OPT`'s value; every pass when it is unset or
@@ -466,13 +566,13 @@ pub fn emit(
         let done = |r: &Result<(HostShader, Option<u32>), ShaderError>| matches!(r, Ok((_, wave)) if *wave != Some(64));
         // Each host wave as a wave of its own (`lower::with_local_waves`),
         // for programs still stopped where not every lane runs.
-        let local_on = std::env::var_os("VICTORY_WAVE_LOCAL").is_none_or(|v| v != "0");
+        let local_on = wave_local() != 0;
         // Where the wave operations are the allocation idiom
         // ([`lower::wave_local`]) that is exact. Other programs are taken
         // the same way last of all, each half-wave giving its own results
         // (approximate: a tile-wide result becomes two half-tile ones);
         // `VICTORY_WAVE_LOCAL=idiom` refuses those instead.
-        let strict = std::env::var_os("VICTORY_WAVE_LOCAL").is_some_and(|v| v == "idiom");
+        let strict = wave_local() == 2;
         let idiom = |p: &ir::Program, st: &structure::Structured| match lower::wave_local(p, st) {
             Ok(()) => true,
             Err((offset, what)) => {
@@ -548,12 +648,11 @@ pub fn emit(
         // lost the card in a submission of two programs that had just moved to it
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
-        let wide_on =
-            std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1") || WAVE_WIDE_HERE.get();
+        let wide_on = wave_wide() == 1 || WAVE_WIDE_HERE.get();
         // `VICTORY_WAVE_WIDE=last`: the same form, but only for programs that every other
         // form below leaves at 64 lanes (on a 32-lane host those are refused outright), so
         // the programs the approximate forms already take keep their barrier-free form.
-        let wide_last = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "last");
+        let wide_last = wave_wide() == 2;
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
@@ -563,7 +662,7 @@ pub fn emit(
                 // ([`ir::without_skips`], `deep`): most of the body is then code every
                 // lane runs, where the two host waves can exchange.
                 // (`VICTORY_WAVE_DEEP_SKIPS=0` and `VICTORY_WAVE_WIDE=0` turn the two off.)
-                let deep_on = std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0");
+                let deep_on = deep_skips();
                 let deep = if deep_on {
                     form(
                         "without skips, scalars followed",
@@ -660,7 +759,7 @@ pub fn emit(
             }
         }
         if wide_last {
-            let deep_on = std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0");
+            let deep_on = deep_skips();
             let deep = if deep_on {
                 form(
                     "without skips, scalars followed",
@@ -689,9 +788,7 @@ pub fn emit(
     // lowering has named the skipped blocks).
     let original = match original {
         Err(ShaderError::Unsupported { what, .. })
-            if native.stage == HwStage::Cs
-                && what == lower::LANE_MASK
-                && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0") =>
+            if native.stage == HwStage::Cs && what == lower::LANE_MASK && wave_wide() != 0 =>
         {
             let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some());
             match again {
@@ -985,6 +1082,99 @@ mod tests {
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
     use super::parse_loop_limit;
+
+    /// Switches named in the translator that do not change the emitted DXIL.
+    /// A new `"VICTORY_*"` string must be added here or to the list below.
+    const IGNORED_SWITCHES: &[&str] = &[
+        "VICTORY_CONSOLE_DXC",
+        "VICTORY_D3D12_DEBUG",
+        "VICTORY_DECODE",
+        "VICTORY_DECODE_WAVE64",
+        "VICTORY_DESC_WHY",
+        "VICTORY_DIFF_ONLY",
+        "VICTORY_DXIL",
+        "VICTORY_EMIT_DUMP",
+        "VICTORY_PC_DXC",
+        "VICTORY_REF_PS",
+        "VICTORY_REF_VS",
+        "VICTORY_SHADER_CENSUS",
+        "VICTORY_SHADER_SOURCE_HASH",
+        "VICTORY_SHADER_SWITCHES",
+        "VICTORY_WARP",
+        "VICTORY_WAVE_WHY",
+    ];
+
+    #[test]
+    fn every_translator_switch_is_in_the_key_or_explicitly_ignored() {
+        let named: std::collections::BTreeSet<&str> = [
+            "VICTORY_BVH_BUILDER",
+            "VICTORY_BVH_EMPTY",
+            "VICTORY_BVH_NO_HIT",
+            "VICTORY_COHERENT_MEM",
+            "VICTORY_DISPATCH_SPLIT",
+            "VICTORY_F16_NEAREST",
+            "VICTORY_FIRSTLANE_OWN",
+            "VICTORY_FIRST_HALF",
+            "VICTORY_GROUP_SYNC",
+            "VICTORY_MESH_OUTPUT_STRICT",
+            "VICTORY_SHADER_LOOP_LIMIT",
+            "VICTORY_SHADER_OPT",
+            "VICTORY_STRICT_JOINS",
+            "VICTORY_WAVE_DEEP_SKIPS",
+            "VICTORY_WAVE_LOCAL",
+            "VICTORY_WAVE_OWN_BITS",
+            "VICTORY_WAVE_WIDE",
+        ]
+        .into_iter()
+        .collect();
+        for name in env!("VICTORY_SHADER_SWITCHES")
+            .split(',')
+            .filter(|n| !n.is_empty())
+        {
+            assert!(
+                named.contains(name) || IGNORED_SWITCHES.contains(&name),
+                "{name} is neither part of the shader cache key nor listed as ignored"
+            );
+        }
+    }
+
+    #[test]
+    fn the_fingerprint_tracks_translation_facts_only() {
+        let facts = super::TranslationFacts {
+            wave: 32,
+            view_null: 999_999,
+            loop_limit: LOOP_LIMIT,
+            group_sync: 2,
+            shader_opt: 191,
+            dispatch_split: false,
+            bvh_empty: false,
+            bvh_no_hit: false,
+            f16_nearest: false,
+            own_bits: true,
+            first_half: true,
+            strict_joins: false,
+            coherent_mem: false,
+            mesh_strict: false,
+            firstlane_own: false,
+            wave_local: 1,
+            wave_wide: 3,
+            deep_skips: true,
+        };
+        assert_eq!(
+            super::fingerprint_of(&facts),
+            super::fingerprint_of(&facts),
+            "the same facts hash the same"
+        );
+        let mut other = facts.clone();
+        other.view_null = 2_097_151;
+        assert_ne!(super::fingerprint_of(&facts), super::fingerprint_of(&other));
+        other = facts.clone();
+        other.shader_opt = 0;
+        assert_ne!(super::fingerprint_of(&facts), super::fingerprint_of(&other));
+        other = facts.clone();
+        other.wave = 64;
+        assert_ne!(super::fingerprint_of(&facts), super::fingerprint_of(&other));
+    }
 
     #[test]
     fn the_clean_up_switch_parses_or_runs_every_pass() {

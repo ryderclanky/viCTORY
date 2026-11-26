@@ -33,11 +33,21 @@ pub struct Cache {
 
 impl Cache {
     /// Opens (creating) a cache at `root`. Refuses locations inside the repo.
+    ///
+    /// The directory is stored as an absolute path, so a later change of the
+    /// process's working directory still reads and writes the same files.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
         victory_core::ensure_outside_repo(&root)?;
         std::fs::create_dir_all(&root).with_context(|| format!("creating {}", root.display()))?;
+        let root = std::fs::canonicalize(&root)
+            .with_context(|| format!("resolving {}", root.display()))?;
         Ok(Cache { root })
+    }
+
+    /// The absolute directory entries are stored under.
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 
     pub fn path_for(&self, key: &CacheKey) -> PathBuf {
@@ -79,13 +89,20 @@ impl Cache {
                 .with_context(|| format!("reusing the staging file {}", tmp.display()))?,
             Err(e) => return Err(e.into()),
         };
-        let written = file.write_all(&output);
+        let written = file.write_all(&output).and_then(|()| file.sync_all());
         drop(file);
-        let published = written.and_then(|()| std::fs::rename(&tmp, &path));
+        // Another thread may have published the same key while this one
+        // converted. The file on disk is then a finished entry; renaming
+        // over it is unnecessary, and a system that refuses the replace
+        // must not throw the conversion away.
+        let published = written.and_then(|()| {
+            std::fs::rename(&tmp, &path).or_else(|e| if path.is_file() { Ok(()) } else { Err(e) })
+        });
         if published.is_err() {
             let _ = std::fs::remove_file(&tmp);
         }
         published?;
+        let _ = std::fs::remove_file(&tmp);
         Ok(path)
     }
 }
