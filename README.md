@@ -60,6 +60,41 @@ Every value is still overridden by its own switch. `VICTORY_PROFILE=0` keeps the
 defaults; `=small` and `=large` force one of the two profiles; nothing at all reads the machine,
 and a machine whose budget cannot be read gets the shipped defaults unchanged.
 
+### 16 GB RAM / 8 GB VRAM
+
+A laptop with 16 GB of system RAM and an 8 GB NVIDIA card (Acer Nitro, i7-13620H,
+RTX 5060 Laptop) was running out of memory in the intro: about 18-20 GiB of private
+bytes and a few hundred megabytes of RAM free. Series X title memory alone is about
+13.5 GiB. The switches below are off unless set, except shared texture heaps, which
+follow the small-machine profile (`VICTORY_TEXTURE_HEAPS=0` turns them off).
+
+```
+set VICTORY_CONSOLE=series-s
+set VICTORY_PROFILE=small
+set VICTORY_TEXTURE_DROP_MIPS=2
+set VICTORY_TEXTURE_HEAPS=1
+set VICTORY_TEXTURE_HEAP_MB=64
+set VICTORY_AMBIENT=0.25
+set VICTORY_TEXTURE_BACK=1
+set VICTORY_INPLACE=0
+set VICTORY_CARD_FETCH_INFLIGHT=0
+victory run <game dir>\<the title's exe> --execute
+```
+
+`VICTORY_CONSOLE` applies only when `--console` is not passed. `--console series-x`
+still forces the larger console.
+
+| Switch | Default | What it does |
+| --- | --- | --- |
+| `VICTORY_TEXTURE_DROP_MIPS` | `0` | Leave out this many largest levels of big 2D textures the title fills (1 or 2; at most 4). Views and copies shift so the texels that remain stay bound. Textures under 512 texels, short splash chains, render targets and the ocean maps `VICTORY_TEXTURE_BACK` copies are left whole. |
+| `VICTORY_TEXTURE_HEAPS` | on for the small profile, off otherwise | Place those textures in shared 64 MiB heaps instead of one committed resource each, so the driver holds fewer private allocations. A range is reused only after the card has finished with it. |
+| `VICTORY_TEXTURE_HEAP_MB` | `64` (32 to 256) | Size of one shared heap. 256 was measured on a 16 GB card; 64 leaves room on an 8 GB card. |
+| `VICTORY_AMBIENT` | off | After the screen-probe resolve, replace its indirect light with a constant in `0.0..=1.0` so shadowed geometry is visible while ray tracing stays off. `0.25` is the laptop preset; `0.6` is brighter and can glow in fog. |
+| `VICTORY_CONSOLE` | Series X | `series-s` gives the title the smaller console's memory (under 8 GiB) and device type. |
+| `VICTORY_INPLACE` | `0` | Stays off. Reading title memory in place was slower. |
+| `VICTORY_CARD_FETCH_INFLIGHT` | `0` | Stays off. It cut copy-back waits and made the card much busier. |
+| `VICTORY_BVH_BUILDER` | off | Ray tracing stays off. The ambient floor is the stand-in for the missing bounce light. |
+
 ## Status of this fork (2026-11-26, 11:50 UTC)
 
 **Playable, slowly: about 8 to 9.5 world frames per second at the first boat mission (the console runs

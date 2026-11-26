@@ -619,13 +619,21 @@ pub(crate) const SRGB: [(u32, u32); 3] = [(29, 28), (91, 87), (93, 88)];
 /// typeless (see [`DEPTH_FORMATS`], [`SRGB`]): the title's own; `None` if
 /// the host copy is typed.
 pub(crate) fn view_format(this: This) -> Option<u32> {
-    // First: a view of no resource (a typed null view) has none.
-    let host = host_resource(this)?;
-    let own = pc_format(resource(this).desc.format);
-    // SAFETY: a live resource.
-    let format = unsafe { host.GetDesc() }.Format.0 as u32;
-    // A stand-in target is typed.
-    (format != own && format != target_format(own)).then_some(own)
+    #[cfg(not(windows))]
+    {
+        let _ = this;
+        return None;
+    }
+    #[cfg(windows)]
+    {
+        // First: a view of no resource (a typed null view) has none.
+        let host = host_resource(this)?;
+        let own = pc_format(resource(this).desc.format);
+        // SAFETY: a live resource.
+        let format = unsafe { host.GetDesc() }.Format.0 as u32;
+        // A stand-in target is typed.
+        (format != own && format != target_format(own)).then_some(own)
+    }
 }
 
 /// Depth formats with their typeless family: depth textures that shaders
@@ -1135,6 +1143,9 @@ pub(crate) struct HostTexture {
     /// levels have been given. Its `bytes` are 0: what it holds of the card
     /// is counted there.
     pub(crate) tiled: Option<crate::tiles::Tiled>,
+    /// Placed in a shared heap (`crate::heaps`). The range stays taken until
+    /// this copy is gone and nothing else holds the resource.
+    cut: Option<crate::heaps::Cut>,
 }
 
 /// What a title texture has on the host: its host copy and, for a depth
@@ -1389,7 +1400,11 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             && r.desc.dimension == TEXTURE_2D
             && r.desc.depth_or_array_size == 1
             && r.desc.mip_levels > 1
-            && r.desc.sample_count <= 1;
+            && r.desc.sample_count <= 1
+            // The tile path numbers levels as the title does. A host copy
+            // that leaves levels out (`VICTORY_TEXTURE_DROP_MIPS`) stays
+            // on the plain path.
+            && drop_levels(&r.desc) == 0;
         if shape_fits && r.host.placed.load(Relaxed) && crate::tiles::wanted() {
             let bytes = footprint(&r.desc).map_or(0, |f| f.size);
             let start = r.data() as u64;
@@ -1404,7 +1419,9 @@ fn hosted(this: This, make: bool) -> Option<Made> {
                         .is_some()
                     || crate::descriptor::host::first_viewed(start).is_some_and(|first| first > 0));
             let reserved = if partly {
-                host_texture_as(&r.desc, r.host.state, clear, true).ok()
+                host_texture_as(&r.desc, r.host.state, clear, true)
+                    .ok()
+                    .map(|(texture, _)| texture)
             } else {
                 None
             };
@@ -1421,11 +1438,11 @@ fn hosted(this: This, make: bool) -> Option<Made> {
                 texture = reserved;
             }
         }
-        let texture = match texture {
-            Some(texture) => Ok(texture),
+        let made_texture = match texture {
+            Some(texture) => Ok((texture, None)),
             None => host_texture(&r.desc, r.host.state, clear),
         };
-        let texture = match texture {
+        let (texture, cut) = match made_texture {
             Ok(texture) => texture,
             Err(NoTexture::Refused) => {
                 r.host.refused.store(true, Relaxed);
@@ -1462,6 +1479,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             Some(tiled) => HostTexture::new_tiled(texture, state, tiled),
             None => HostTexture::new(texture, state),
         };
+        host.cut = cut;
         host.filled = fills(&r.desc);
         if host.filled {
             KINDS[0].fetch_add(1, Relaxed);
@@ -2194,6 +2212,7 @@ fn shortage(video: Option<[u64; 4]>) -> Option<u64> {
 /// `VICTORY_TEXTURE_SWEEP=0` lets nothing go.
 #[cfg(windows)]
 pub(crate) fn let_go_idle() {
+    crate::heaps::reclaim();
     use std::sync::atomic::Ordering::Relaxed;
     const IDLE_FRAMES: u64 = 4;
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -2479,6 +2498,7 @@ impl HostTexture {
             bytes,
             filled: false,
             tiled: None,
+            cut: None,
         }
     }
 
@@ -2496,6 +2516,7 @@ impl HostTexture {
             bytes: 0,
             filled: false,
             tiled: Some(tiled),
+            cut: None,
         }
     }
 }
@@ -2509,6 +2530,12 @@ impl Drop for HostTexture {
         if self.filled {
             KINDS[0].fetch_sub(1, Relaxed);
             KINDS[1].fetch_sub(self.bytes, Relaxed);
+        }
+        // The range stays taken while a slot or a list still holds the
+        // resource. `reclaim` gives it back after those let go and the
+        // card has finished the submissions that named it.
+        if let Some(cut) = self.cut.take() {
+            crate::heaps::defer_release(self.texture.clone(), cut);
         }
     }
 }
@@ -2606,8 +2633,77 @@ fn host_texture(
     desc: &ResourceDesc,
     state: u32,
     clear: *const c_void,
-) -> Result<windows::Win32::Graphics::Direct3D12::ID3D12Resource, NoTexture> {
+) -> Result<
+    (
+        windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+        Option<crate::heaps::Cut>,
+    ),
+    NoTexture,
+> {
     host_texture_as(desc, state, clear, false)
+}
+
+/// How many of its largest levels the host copy of `desc` leaves out
+/// (`VICTORY_TEXTURE_DROP_MIPS`). 0 when the switch is off or `desc` is not
+/// a large 2D texture the title fills.
+#[cfg(windows)]
+pub(crate) fn drop_levels(desc: &ResourceDesc) -> u32 {
+    crate::laptop::dropped_levels(asked_drop(), &shape_of(desc))
+}
+
+/// [`drop_levels`] of title resource `this`; 0 for buffers and null.
+#[cfg(windows)]
+pub(crate) fn dropped(this: This) -> u32 {
+    if this.is_null() {
+        return 0;
+    }
+    drop_levels(&resource(this).desc)
+}
+
+/// The host copy's subresource for subresource `index` of title texture
+/// `this`. `None` for a level the host copy leaves out.
+#[cfg(windows)]
+pub(crate) fn host_subresource(this: This, index: u32) -> Option<u32> {
+    let desc = &resource(this).desc;
+    crate::laptop::host_subresource(dropped(this), u32::from(desc.mip_levels).max(1), index)
+}
+
+/// Subresources in the first plane of title texture `this`, as the title
+/// numbers them (levels times slices).
+#[cfg(windows)]
+pub(crate) fn title_subresources(this: This) -> u32 {
+    let desc = &resource(this).desc;
+    u32::from(desc.mip_levels).max(1) * u32::from(desc.depth_or_array_size).max(1)
+}
+
+#[cfg(windows)]
+fn shape_of(desc: &ResourceDesc) -> crate::laptop::TextureShape {
+    crate::laptop::TextureShape {
+        dimension: desc.dimension,
+        flags: desc.flags,
+        sample_count: desc.sample_count,
+        mip_levels: u32::from(desc.mip_levels),
+        width: desc.width,
+        height: u64::from(desc.height),
+    }
+}
+
+/// `VICTORY_TEXTURE_DROP_MIPS`, read once.
+#[cfg(windows)]
+fn asked_drop() -> u32 {
+    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        let n = crate::laptop::parse_drop_mips(
+            std::env::var("VICTORY_TEXTURE_DROP_MIPS").ok().as_deref(),
+        );
+        if n > 0 {
+            tracing::info!(
+                levels = n,
+                "large 2D textures the title fills leave out their largest levels on the host (VICTORY_TEXTURE_DROP_MIPS)"
+            );
+        }
+        n
+    })
 }
 
 /// [`host_texture`]; `reserved`: without memory of its own, to be given
@@ -2618,7 +2714,13 @@ fn host_texture_as(
     state: u32,
     clear: *const c_void,
     reserved: bool,
-) -> Result<windows::Win32::Graphics::Direct3D12::ID3D12Resource, NoTexture> {
+) -> Result<
+    (
+        windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+        Option<crate::heaps::Cut>,
+    ),
+    NoTexture,
+> {
     use windows::Win32::Graphics::Direct3D12::*;
     const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
     if desc.dimension == BUFFER {
@@ -2627,8 +2729,21 @@ fn host_texture_as(
     let host = crate::host::host().ok_or(NoTexture::ForNow)?;
     let mut d = *desc;
     d.layout = 0;
-    d.alignment = 0;
+    // Reserved textures take only the default 64 KiB alignment. The title's
+    // 4 KiB one makes the host refuse every one of them (`laptop::reserved_alignment`).
+    d.alignment = if reserved {
+        crate::laptop::reserved_alignment(desc.alignment)
+    } else {
+        0
+    };
     d.flags &= PC_FLAGS;
+    let dropped = if reserved { 0 } else { drop_levels(desc) };
+    if dropped > 0 {
+        let (width, height, mips) = crate::laptop::shrunk(d.width, d.height, d.mip_levels, dropped);
+        d.width = width;
+        d.height = height;
+        d.mip_levels = mips;
+    }
     // PC refuses depth targets that are also unordered-access (the console
     // allows both; the title's shadow maps ask for it).
     // The host copy loses the unordered access: shaders write a colour
@@ -2672,22 +2787,35 @@ fn host_texture_as(
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()
     };
+    let initial = D3D12_RESOURCE_STATES(crate::host::legal_for(
+        d.flags,
+        crate::host::texture_state(state),
+    ) as i32);
+    // Textures the title fills can share a heap. Render targets and reserved
+    // (levels on demand) textures stay as they were.
+    if !reserved
+        && fills(desc)
+        && let Some((placed, cut)) = crate::heaps::place(host, &d, initial)
+    {
+        crate::host::name(&placed, || {
+            format!(
+                "texture {}x{} f{} flags {:#x} (shared heap)",
+                d.width, d.height, d.format, d.flags
+            )
+        });
+        return Ok((placed, Some(cut)));
+    }
     let mut texture: Option<ID3D12Resource> = None;
     let made = if reserved {
         // The card's own layout of 64 KiB tiles, which a reserved texture
-        // must have.
+        // must have. Alignment was set to the default above: the title's
+        // 4 KiB alignment is refused here.
         d.layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE.0 as u32;
+        d.alignment = crate::laptop::reserved_alignment(d.alignment);
         // SAFETY: as below; a texture the title fills has no clear value.
         unsafe {
-            host.device.CreateReservedResource(
-                (&raw const d).cast(),
-                D3D12_RESOURCE_STATES(crate::host::legal_for(
-                    d.flags,
-                    crate::host::texture_state(state),
-                ) as i32),
-                None,
-                &mut texture,
-            )
+            host.device
+                .CreateReservedResource((&raw const d).cast(), initial, None, &mut texture)
         }
     } else {
         // SAFETY: the description has the host layout (checked size, same
@@ -2697,10 +2825,7 @@ fn host_texture_as(
                 &heap,
                 D3D12_HEAP_FLAG_NONE,
                 (&raw const d).cast(),
-                D3D12_RESOURCE_STATES(crate::host::legal_for(
-                    d.flags,
-                    crate::host::texture_state(state),
-                ) as i32),
+                initial,
                 // The same layout: format, then color or depth and stencil.
                 clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast()),
                 &mut texture,
@@ -2722,11 +2847,19 @@ fn host_texture_as(
     let texture = texture.ok_or(NoTexture::Refused)?;
     crate::host::name(&texture, || {
         format!(
-            "texture {}x{} f{} flags {:#x}",
-            d.width, d.height, d.format, d.flags
+            "texture {}x{} f{} flags {:#x}{}",
+            d.width,
+            d.height,
+            d.format,
+            d.flags,
+            if dropped > 0 {
+                format!(" (top {dropped} levels left out)")
+            } else {
+                String::new()
+            }
         )
     });
-    Ok(texture)
+    Ok((texture, None))
 }
 
 /// The host copy of title texture `this` if it is made and was made
