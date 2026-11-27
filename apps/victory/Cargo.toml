@@ -12,6 +12,7 @@ victory-core.workspace = true
 victory-pe.workspace = true
 victory-loader.workspace = true
 victory-hle.workspace = true
+victory-gpu.workspace = true
 victory-shader = { workspace = true, features = ["host"] }
 victory-game.workspace = true
 anyhow.workspace = true
@@ -26,6 +27,7 @@ walkdir.workspace = true
 diagnostics = [
     "victory-core/diagnostics",
     "victory-hle/diagnostics",
+    "victory-gpu/diagnostics",
     "victory-loader/diagnostics",
     "victory-shader/diagnostics",
 ]

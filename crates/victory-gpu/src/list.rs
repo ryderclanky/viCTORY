@@ -144,6 +144,9 @@ const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 #[cfg(windows)]
 fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
     let Some(list) = host_list(this) else { return };
+    // A draw, dispatch or state call is GPU work: the next UAV barrier
+    // on every resource is a new wait.
+    list.note_gpu_work();
     // List-call time is part of the per-frame line (`VICTORY_FRAME_TIMINGS`).
     // Diagnostics builds time every call either way, for the frame log.
     let started =
@@ -782,6 +785,26 @@ const UAV_BARRIER: Barrier = Barrier {
     last: 0,
 };
 
+fn global_uav(kind: u32, resource_null: bool) -> bool {
+    kind == 2 && resource_null
+}
+
+/// A batch after `prior_global` (the list's last GPU command was a UAV on
+/// every resource). `global` is how many such barriers the batch has,
+/// `other` how many name a resource or change a state. Returns whether to
+/// record the batch, and whether the list then ends on a global UAV.
+/// A second global UAV with nothing between them is the same wait, so it
+/// is not recorded. A barrier that names a resource is kept.
+fn uav_batch(prior_global: bool, global: usize, other: usize) -> (bool, bool) {
+    if global == 0 && other == 0 {
+        return (false, prior_global);
+    }
+    if other == 0 && global > 0 && prior_global {
+        return (false, true);
+    }
+    (true, global > 0)
+}
+
 /// Returns the console's barrier "actions" (none).
 extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
     #[cfg(windows)]
@@ -790,32 +813,53 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
     {
         // SAFETY: the title passes `count` barriers.
         let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
-        let mut host: Vec<Barrier> = barriers
-            .iter()
-            .filter_map(|b| host_barrier(list, b))
-            .collect();
+        let mut host: Vec<Barrier> = Vec::new();
+        let mut global = 0usize;
+        for b in barriers {
+            let Some(made) = host_barrier(list, b) else {
+                continue;
+            };
+            // One UAV on every resource per batch. A second is the same wait.
+            if global_uav(made.kind, made.first.is_null()) {
+                global += 1;
+                continue;
+            }
+            host.push(made);
+        }
         // Buffers have host copies, not resources the barrier can name:
         // a barrier on one waits for every shader write before it.
+        // A texture UAV above already names its resource and is not widened.
         if barriers.iter().any(|b| {
             b.kind != 1 && !b.first.is_null() && crate::resource::buffer_bytes(b.first).is_some()
         }) {
-            host.push(UAV_BARRIER);
+            global += 1;
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::WaitsForBuffers, 1);
         }
-        if !host.is_empty() {
-            use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
-            const _: () = assert!(size_of::<Barrier>() == size_of::<D3D12_RESOURCE_BARRIER>());
-            // SAFETY: the same layout; borrowed resource pointers, never
-            // released through this slice.
-            let host = unsafe {
-                std::slice::from_raw_parts(
-                    host.as_ptr().cast::<D3D12_RESOURCE_BARRIER>(),
-                    host.len(),
-                )
-            };
-            // SAFETY: an open list and live resources.
-            unsafe { list.list.ResourceBarrier(host) };
+        let (record, ends_global) = uav_batch(list.global_uav_open(), global, host.len());
+        if record {
+            if global > 0 {
+                host.push(UAV_BARRIER);
+            }
+            if !host.is_empty() {
+                use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
+                const _: () = assert!(size_of::<Barrier>() == size_of::<D3D12_RESOURCE_BARRIER>());
+                // SAFETY: the same layout; borrowed resource pointers, never
+                // released through this slice.
+                let host = unsafe {
+                    std::slice::from_raw_parts(
+                        host.as_ptr().cast::<D3D12_RESOURCE_BARRIER>(),
+                        host.len(),
+                    )
+                };
+                // SAFETY: an open list and live resources.
+                unsafe { list.list.ResourceBarrier(host) };
+            }
+        }
+        if ends_global {
+            list.note_global_uav();
+        } else if record {
+            list.note_gpu_work();
         }
     }
     0
@@ -964,6 +1008,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
         let Some(list) = host_list(this) else {
             return;
         };
+        list.note_gpu_work();
         // A copy on the card may write a buffer: no indirect draw after it joins a window before it.
         crate::indirect::end_window(list);
         if let (Some(to), Some(from)) = (
@@ -1120,6 +1165,7 @@ extern "system" fn copy_texture_region(
         else {
             return;
         };
+        list.note_gpu_work();
         // A copy on the card (textures, or texels read back into a buffer of ours): no indirect draw after it joins
         // a window before it (conservative: none of these writes an argument buffer).
         crate::indirect::end_window(list);
@@ -1391,6 +1437,7 @@ extern "system" fn resolve(
             crate::resource::host_resource(src),
         )
     {
+        list.note_gpu_work();
         use windows::Win32::Foundation::RECT;
         use windows::Win32::Graphics::Direct3D12::{
             D3D12_RESOLVE_MODE_AVERAGE, ID3D12GraphicsCommandList1,
@@ -1470,6 +1517,7 @@ extern "system" fn clear_rtv(
         else {
             return;
         };
+        list.note_gpu_work();
         let (Some(texture), Some(host)) = (
             crate::resource::host_resource(record.resource),
             crate::host::host(),
@@ -1521,6 +1569,7 @@ extern "system" fn clear_dsv(
         else {
             return;
         };
+        list.note_gpu_work();
         let (Some(texture), Some(host)) = (
             crate::resource::host_resource(record.resource),
             crate::host::host(),
@@ -2267,12 +2316,19 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     if count > 0
         && let Some(list) = host_list(this)
     {
-        use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
-        // SAFETY: the same layout; no resource named.
-        let barrier =
-            unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
-        // SAFETY: an open list.
-        unsafe { list.list.ResourceBarrier(&[barrier]) };
+        // The groups name layouts the list already applies itself. What
+        // remains is the order of shader writes. A second such barrier
+        // with no GPU work since the last one is the same wait.
+        let (record, _) = uav_batch(list.global_uav_open(), 1, 0);
+        if record {
+            use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
+            // SAFETY: the same layout; no resource named.
+            let barrier =
+                unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
+            // SAFETY: an open list.
+            unsafe { list.list.ResourceBarrier(&[barrier]) };
+            list.note_global_uav();
+        }
     }
     #[cfg(not(windows))]
     let _ = (this, count);
@@ -2493,6 +2549,20 @@ static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[test]
+    fn a_second_global_uav_with_no_work_between_is_not_recorded() {
+        assert_eq!(uav_batch(false, 2, 0), (true, true));
+        assert_eq!(uav_batch(true, 1, 0), (false, true));
+        assert_eq!(uav_batch(true, 0, 0), (false, true));
+        // A barrier that names a resource is kept, and it ends the open global wait.
+        assert_eq!(uav_batch(true, 0, 1), (true, false));
+        assert_eq!(uav_batch(true, 1, 1), (true, true));
+        assert_eq!(uav_batch(false, 0, 2), (true, false));
+        assert!(global_uav(2, true));
+        assert!(!global_uav(2, false));
+        assert!(!global_uav(0, true));
+    }
 
     #[test]
     fn every_inline_command_falls_back_to_the_table() {

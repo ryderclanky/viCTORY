@@ -2216,7 +2216,8 @@ fn joined_over(runs: Vec<(usize, usize)>, gap: usize) -> Vec<(usize, usize)> {
 
 /// The gap, in bytes, over which the title bytes put into a copy in the
 /// card's memory under flights' shader writes are joined into one run
-/// (`VICTORY_MERGE_GAP`, 0 to 64; 64 by default). `0` keeps every run exact.
+/// (`VICTORY_MERGE_GAP`, 0 to 64; 0 by default: only the bytes the title
+/// changed go up, as before).
 ///
 /// Run 219: the title rewrites some hundred pages of its big buffer a
 /// frame while flights that may write that buffer are in the air, and
@@ -2230,12 +2231,15 @@ fn joined_over(runs: Vec<(usize, usize)>, gap: usize) -> Vec<(usize, usize)> {
 /// side of the copy, and goes up with its run. If a flight in the air
 /// wrote exactly that byte on the card (a shader store within `gap` bytes
 /// between two bytes the title changed in the same frame), the store is
-/// overwritten with the old value, and no compare finds it.
-/// `VICTORY_MERGE_GAP=0` is that exact merge.
+/// overwritten with the old value, and no compare finds it. Exact (0) is
+/// the default for that reason.
 fn merge_gap() -> usize {
     static GAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *GAP.get_or_init(|| {
-        crate::laptop::merge_gap_bytes(std::env::var("VICTORY_MERGE_GAP").ok().as_deref())
+        std::env::var("VICTORY_MERGE_GAP")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map_or(0, |n| n.min(64))
     })
 }
 
@@ -3674,7 +3678,46 @@ impl Shadow {
         let last = last_difference(now, held).unwrap_or(first);
         let (at, _n) = (at + first, last + 1 - first);
         let (gpu, held) = (&now[first..=last], &mut held[first..=last]);
-        self.store_merged(start + at, gpu, held, title, "pc relay")
+        let mut written = 0;
+        let dirty = crate::laptop::dirty_blocks(gpu, held, crate::laptop::MERGE_BLOCK);
+        for (off, len) in dirty {
+            let addr = start + at + off;
+            title.clear();
+            title.resize(len, 0);
+            #[cfg(feature = "diagnostics")]
+            let _reads_as = crate::backreads::reading_as(crate::backreads::MERGE, self.id);
+            #[cfg(feature = "diagnostics")]
+            crate::backreads::before(addr);
+            // Title memory not there: looked at again when the next flight
+            // that declared the range lands (the snapshot stays as it is).
+            if !crate::host::read_into(addr as *const u8, title) {
+                continue;
+            }
+            let as_read = merge_race_on().then(|| title.clone());
+            if !merge_piece(&gpu[off..off + len], &mut held[off..off + len], title) {
+                continue;
+            }
+            crate::host::shaders_write(addr, &title[..]);
+            if self.put_back_own(addr, &title[..]) {
+                #[cfg(feature = "diagnostics")]
+                crate::backreads::stored(self.id, (self.start, self.len), addr, len, true);
+                written += len;
+                continue;
+            }
+            crate::watch::writing(addr, len);
+            merge_race(
+                as_read.as_deref(),
+                (self.start, self.len),
+                addr,
+                &title[..],
+                "pc relay",
+            );
+            crate::host::write_mapped(addr as *mut u8, title.as_ptr(), len);
+            #[cfg(feature = "diagnostics")]
+            crate::backreads::stored(self.id, (self.start, self.len), addr, len, false);
+            written += len;
+        }
+        written
     }
 
     /// With `crate::inplace::back_own` (`VICTORY_BACK_OWN_VIEW=1`): stores
@@ -3959,19 +4002,19 @@ impl Shadow {
     /// it is now is compared with what the copy held when the range was
     /// given to the shaders: the copy's CPU side for a copy in the card's
     /// memory (the changed runs go up before the next submission, each a
-    /// copy of its own bytes, `bytes_left` of them at most), the snapshot
+    /// copy of its own bytes, `runs_left` of them at most), the snapshot
     /// for the others (the changed bytes go into the copy and into the
     /// snapshot, so the compare after the card ran takes them for the
     /// title's and not the shaders').
     ///
     /// Whether the caller must still settle the flights: the journal
-    /// cannot say what was written, a snapshot is missing, or `bytes_left`
+    /// cannot say what was written, a snapshot is missing, or `runs_left`
     /// ran out. Pages done before that stay done.
     pub(crate) fn merge_under_writes(
         &self,
         address: usize,
         len: usize,
-        bytes_left: &mut usize,
+        runs_left: &mut usize,
     ) -> bool {
         #[cfg(feature = "diagnostics")]
         let _reads_as = crate::backreads::reading_as(crate::backreads::UNDER, self.id);
@@ -4040,10 +4083,11 @@ impl Shadow {
                     // which only the submitting thread writes.
                     let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                     let runs = joined_over(changed_runs(title, held), merge_gap());
-                    if !crate::laptop::take_merge_bytes(bytes_left, &runs) {
+                    if runs.len() > *runs_left {
                         MERGE_GAVE_UP[2].fetch_add(1, Ordering::Relaxed);
                         return true;
                     }
+                    *runs_left -= runs.len();
                     for (r, m) in runs {
                         held[r..r + m].copy_from_slice(&title[r..r + m]);
                         self.card_changed(at + r, at + r + m);
@@ -4739,76 +4783,63 @@ impl Shadow {
         let mut written = 0;
         for (a, b) in outside(at, at + n, skip) {
             let (lo, hi) = (a - at, b - at);
-            written += self.store_merged(
-                start + a,
+            // A 4 KiB block the card left alone is not read from title
+            // memory and not written back. Adjacent dirty blocks are one
+            // read and one write.
+            let dirty = crate::laptop::dirty_blocks(
                 &gpu[lo..hi],
-                &mut held[lo..hi],
-                title,
-                "card relay",
+                &held[lo..hi],
+                crate::laptop::MERGE_BLOCK,
             );
-        }
-        written
-    }
-
-    /// One read of `[addr, addr + gpu.len())`, the merge in memory, then
-    /// the dirty spans written back joined across gaps of
-    /// [`crate::laptop::MERGE_BLOCK`]. `gpu` and `held` are that region.
-    /// Returns the bytes written to title memory.
-    fn store_merged(
-        &self,
-        addr: usize,
-        gpu: &[u8],
-        held: &mut [u8],
-        title: &mut Vec<u8>,
-        which: &'static str,
-    ) -> usize {
-        let n = gpu.len().min(held.len());
-        if n == 0 {
-            return 0;
-        }
-        let (gpu, held) = (&gpu[..n], &mut held[..n]);
-        let spans = crate::laptop::coalesced_dirty(gpu, held, crate::laptop::MERGE_BLOCK);
-        if spans.is_empty() {
-            return 0;
-        }
-        title.clear();
-        title.resize(n, 0);
-        #[cfg(feature = "diagnostics")]
-        let _reads_as = crate::backreads::reading_as(crate::backreads::MERGE, self.id);
-        #[cfg(feature = "diagnostics")]
-        crate::backreads::before(addr);
-        let mapped = crate::host::read_into(addr as *const u8, title);
-        let as_read = (mapped && merge_race_on()).then(|| title.clone());
-        let changed = merge_piece(gpu, held, title);
-        if !mapped || !changed {
-            return 0;
-        }
-        let mut written = 0;
-        for (off, len) in spans {
-            let at = addr + off;
-            let bytes = &title[off..off + len];
-            crate::host::shaders_write(at, bytes);
-            let same_page = len > 0 && (at / PAGE) == ((at + len - 1) / PAGE);
-            if same_page && self.put_back_own(at, bytes) {
+            for (off, len) in dirty {
+                let addr = start + a + off;
+                title.clear();
+                title.resize(len, 0);
+                // Who touched the page since its last store is looked at
+                // before our own read of it (`VICTORY_BACK_READS`): counted
+                // only.
                 #[cfg(feature = "diagnostics")]
-                crate::backreads::stored(self.id, (self.start, self.len), at, len, true);
+                let _reads_as = crate::backreads::reading_as(crate::backreads::MERGE, self.id);
+                #[cfg(feature = "diagnostics")]
+                crate::backreads::before(addr);
+                let mapped = crate::host::read_into(addr as *const u8, title);
+                let as_read = (mapped && merge_race_on()).then(|| title.clone());
+                let changed = merge_piece(
+                    &gpu[lo + off..lo + off + len],
+                    &mut held[lo + off..lo + off + len],
+                    title,
+                );
+                if !mapped || !changed {
+                    continue;
+                }
+                crate::host::shaders_write(addr, &title[..]);
+                if self.put_back_own(addr, &title[..]) {
+                    #[cfg(feature = "diagnostics")]
+                    crate::backreads::stored(self.id, (self.start, self.len), addr, len, true);
+                    written += len;
+                    continue;
+                }
+                let theirs = if crate::watch::quiet_back() {
+                    crate::watch::ours_before(addr, len)
+                } else {
+                    None
+                };
+                crate::watch::writing(addr, len);
+                merge_race(
+                    as_read.as_deref(),
+                    (self.start, self.len),
+                    addr,
+                    &title[..],
+                    "card relay",
+                );
+                crate::host::write_mapped(addr as *mut u8, title.as_ptr(), len);
+                if let Some(theirs) = &theirs {
+                    self.holds(&crate::watch::ours_after(addr, len), theirs);
+                }
+                #[cfg(feature = "diagnostics")]
+                crate::backreads::stored(self.id, (self.start, self.len), addr, len, false);
                 written += len;
-                continue;
             }
-            let theirs = if crate::watch::quiet_back() {
-                crate::watch::ours_before(at, len)
-            } else {
-                None
-            };
-            let read = as_read.as_deref().map(|whole| &whole[off..off + len]);
-            merge_race(read, (self.start, self.len), at, bytes, which);
-            crate::host::write_merged_runs(at, bytes, &[(0, len)]);
-            if let Some(theirs) = &theirs {
-                self.holds(&crate::watch::ours_after(at, len), theirs);
-            }
-            #[cfg(feature = "diagnostics")]
-            crate::backreads::stored(self.id, (self.start, self.len), at, len, false);
-            written += len;
         }
         written
     }

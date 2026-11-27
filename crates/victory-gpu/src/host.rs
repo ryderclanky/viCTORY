@@ -1856,6 +1856,9 @@ pub(crate) struct HostList {
     /// The pair of timestamps its run is timed with since its last reset
     /// (`crate::cardmeter`), or none.
     meter: AtomicU32,
+    /// The last GPU command was a UAV barrier on every resource. Another
+    /// one, with no GPU work between them, waits for the same writes.
+    global_uav: std::sync::atomic::AtomicBool,
     /// With `crate::cardmeter::pipelines`: the pair of the pipeline bound
     /// last, open until the next one is bound or the list closes.
     pipeline_meter: AtomicU32,
@@ -4656,16 +4659,27 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
     }
     if late_exact() {
         // The title's bytes are put in beside the flights' writes; a
-        // settle is still due where that could not be done. The budget is
-        // bytes, not a count of runs: a few hundred bytes in tens of
-        // thousands of runs used to hit a cap of 512 and settle the flights.
-        let mut bytes_left =
-            crate::laptop::merge_byte_budget(std::env::var("VICTORY_MERGE_BYTES").ok().as_deref());
+        // settle is still due where that could not be done. At most this
+        // many changed runs go up to copies in the card's memory, each a
+        // copy of its own there.
+        // (`VICTORY_MERGE_RUNS`: the cap. Run 218 had 500 to 5,400 changed
+        // runs a frame of a few bytes each, and the cap of 512 settled the
+        // flights twice a frame, 50 ms of the submitting thread.)
+        static RUNS: OnceLock<usize> = OnceLock::new();
+        let mut runs_left = *RUNS.get_or_init(|| {
+            std::env::var("VICTORY_MERGE_RUNS")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .map_or(512, |n| n.clamp(1, 1 << 16))
+        });
+        if settle_room() {
+            runs_left = (runs_left * 8).min(1 << 16);
+        }
         if let Some(wider) = merge_runs_alt() {
-            bytes_left = bytes_left.max(wider);
+            runs_left = wider;
         }
         return spans.iter().any(|(shadow, from, to)| {
-            shadow.merge_under_writes(*from, *to - *from, &mut bytes_left)
+            shadow.merge_under_writes(*from, *to - *from, &mut runs_left)
         });
     }
     spans
@@ -5235,8 +5249,8 @@ fn late_line(frames: f64) {
         tracing::info!(
             "title bytes put in under flights' shader writes per frame (VICTORY_LATE_WAIT=2): {pages:.0} pages looked at, \
              {runs:.0} changed runs, {:.2} MB; in these frames the merge gave up (the flights are then settled whole): {} times \
-             because the copy's memory is not watched, {} because the write tracking had no answer, {} for more changed bytes than \
-             the merge budget leaves, {} for a copy in PC memory without its snapshot",
+             because the copy's memory is not watched, {} because the write tracking had no answer, {} for more changed runs than \
+             VICTORY_MERGE_RUNS leaves, {} for a copy in PC memory without its snapshot",
             bytes / (1 << 20) as f64,
             gave_up[0],
             gave_up[1],
@@ -5688,6 +5702,7 @@ impl Host {
                 open_queries: Mutex::new(Vec::new()),
                 _alive: Counted::new(),
                 meter: AtomicU32::new(u32::MAX),
+                global_uav: std::sync::atomic::AtomicBool::new(false),
                 pipeline_meter: AtomicU32::new(u32::MAX),
                 gather: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -8592,9 +8607,25 @@ impl HostList {
 
     /// Only after the list's last submission finished (every one is waited
     /// for).
+    /// The last GPU command was a barrier on every shader write.
+    pub(crate) fn global_uav_open(&self) -> bool {
+        self.global_uav.load(Ordering::Relaxed)
+    }
+
+    /// A UAV barrier on every resource was just recorded.
+    pub(crate) fn note_global_uav(&self) {
+        self.global_uav.store(true, Ordering::Relaxed)
+    }
+
+    /// A GPU command that is not that barrier was just recorded.
+    pub(crate) fn note_gpu_work(&self) {
+        self.global_uav.store(false, Ordering::Relaxed)
+    }
+
     pub(crate) fn reset(&self) {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
+        self.global_uav.store(false, Ordering::Relaxed);
         self._alive.used();
         *self.clamp_window.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *self.deferred() = Deferred::default();
@@ -11021,20 +11052,6 @@ unsafe extern "system" {
 fn direct_writes() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_DIRECT_WRITES").is_none_or(|v| v != "0"))
-}
-
-/// Writes coalesced dirty spans of one merged region. `runs` are
-/// `(offset, len)` into `merged`, placed at title address `dst`. Each run
-/// is one kernel write; the caller has already joined runs a short gap
-/// apart, so this is not one write per 4 KiB block.
-pub(crate) fn write_merged_runs(dst: usize, merged: &[u8], runs: &[(usize, usize)]) {
-    for &(off, len) in runs {
-        if len == 0 || off.saturating_add(len) > merged.len() {
-            continue;
-        }
-        crate::watch::writing(dst + off, len);
-        write_mapped((dst + off) as *mut u8, merged[off..].as_ptr(), len);
-    }
 }
 
 /// Copies host memory into title memory after a submission (what shaders
