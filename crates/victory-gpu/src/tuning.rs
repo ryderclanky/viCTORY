@@ -44,16 +44,6 @@ pub(crate) struct Profile {
     pub(crate) texture_heaps: bool,
 }
 
-impl Profile {
-    /// Levels on demand and the short staging pool. That is a machine with
-    /// at most about 20 GiB of RAM (`choose`), or `VICTORY_PROFILE=small`.
-    /// A large RAM figure with a small card is not this: the card is sized,
-    /// and the PC's memory is not short.
-    pub(crate) fn tight(self) -> bool {
-        self.levels_on_demand && self.staging_mb <= 64
-    }
-}
-
 /// The defaults this fork shipped with, for a machine nothing is known about: the reference
 /// machine's values.
 const LARGE: Profile = Profile {
@@ -191,11 +181,6 @@ pub(crate) fn profile() -> &'static Profile {
     })
 }
 
-/// Whether this process is on a tight machine ([`Profile::tight`]).
-pub(crate) fn tight_ram() -> bool {
-    profile().tight()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -233,15 +218,6 @@ mod tests {
         assert!(p.levels_on_demand);
         assert_eq!(p.staging_mb, 64);
         assert!(p.texture_heaps, "a 16 GB machine shares texture heaps");
-        assert!(p.tight(), "16 GB of RAM is the tight profile");
-        assert!(
-            !choose(32, 10_200).tight(),
-            "the reference machine is not tight"
-        );
-        assert!(
-            !choose(64, 6_500).tight(),
-            "plenty of RAM with a small card does not shrink the PC's pools"
-        );
         // a 4 GB card keeps its floor, never nothing
         assert_eq!(choose(16, 3_800).targets_room_mb, 950);
         assert_eq!(choose(16, 1_000).targets_room_mb, 512);

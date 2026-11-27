@@ -893,7 +893,9 @@ pub fn frame() {
             let prep = {
                 let mut at = PREP_AT.lock().unwrap_or_else(|e| e.into_inner());
                 let now = crate::host::prep_parts_us();
-                let prep = std::array::from_fn(|i| now[i].wrapping_sub(at[i]));
+                // Monotonic totals. A counter that went backwards was reset;
+                // report nothing huge for that part rather than the underflow.
+                let prep = std::array::from_fn(|i| now[i].saturating_sub(at[i]));
                 *at = now;
                 prep
             };

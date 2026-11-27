@@ -87,16 +87,25 @@ static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::ne
 static PREP_PARTS: [std::sync::atomic::AtomicU64; 6] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 6];
 
-/// Preparing time by part, microseconds since the frame-rate line last
-/// took them ([`PREP_PARTS`]). The per-frame line reads the difference.
+/// The same parts, never taken back. [`PREP_PARTS`] is swapped to zero when
+/// the frame-rate line is written, so a per-frame difference of it wraps
+/// on that frame (a multi-second "part" that is really an underflow).
+static PREP_TOTAL: [std::sync::atomic::AtomicU64; 6] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
+/// Preparing time by part since the start, microseconds. The per-frame
+/// line differences this. It is not reset when the frame-rate line takes
+/// [`PREP_PARTS`].
 pub(crate) fn prep_parts_us() -> [u64; 6] {
-    PREP_PARTS.each_ref().map(|p| p.load(Ordering::Relaxed))
+    PREP_TOTAL.each_ref().map(|p| p.load(Ordering::Relaxed))
 }
 
 /// Adds the time since `since` to part `i` of [`PREP_PARTS`]; now.
 fn prep_part(i: usize, since: std::time::Instant) -> std::time::Instant {
     let now = std::time::Instant::now();
-    PREP_PARTS[i].fetch_add((now - since).as_micros() as u64, Ordering::Relaxed);
+    let us = (now - since).as_micros() as u64;
+    PREP_PARTS[i].fetch_add(us, Ordering::Relaxed);
+    PREP_TOTAL[i].fetch_add(us, Ordering::Relaxed);
     now
 }
 

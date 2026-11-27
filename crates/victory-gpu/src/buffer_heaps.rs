@@ -10,8 +10,9 @@
 //! cannot pin a heap. A range comes back only once the resource's last
 //! reference is the heap's own note of it.
 //!
-//! `VICTORY_BUFFER_HEAPS=0` keeps a committed buffer each. Unset, a tight
-//! machine turns the heaps on.
+//! `VICTORY_BUFFER_HEAPS=1` places them. Unset, each buffer stays committed:
+//! the heaps commit 64 MiB whole, and that raised private RAM on a 16 GB
+//! machine.
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -78,7 +79,6 @@ fn enabled() -> bool {
     *ON.get_or_init(|| {
         let on = crate::laptop::buffer_heaps_on(
             std::env::var("VICTORY_BUFFER_HEAPS").ok().as_deref(),
-            crate::tuning::tight_ram(),
         );
         if on {
             tracing::info!(

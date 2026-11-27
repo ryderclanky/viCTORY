@@ -166,16 +166,11 @@ pub(crate) fn ui_plane_mode(raw: Option<&str>) -> u8 {
 }
 
 /// Whether host copies of title memory share heaps (`VICTORY_BUFFER_HEAPS`).
-/// `1` / `on` forces them, `0` / `off` keeps one committed buffer each, and
-/// anything else follows the tight-RAM profile. Each committed write-back
-/// buffer is its own driver allocation; a 16 GB machine holds thousands of
-/// them (windows and the small title buffers).
-pub(crate) fn buffer_heaps_on(raw: Option<&str>, tight: bool) -> bool {
-    match raw.map(str::trim) {
-        Some("1" | "on") => true,
-        Some("0" | "off") => false,
-        _ => tight,
-    }
+/// `1` / `on` places them, anything else keeps one committed buffer each.
+/// A tight machine does not turn this on: the shared heaps commit their
+/// whole 64 MiB, and on the 16 GB laptop that raised private RAM.
+pub(crate) fn buffer_heaps_on(raw: Option<&str>) -> bool {
+    matches!(raw.map(str::trim), Some("1" | "on"))
 }
 
 /// A shared buffer of `size` bytes is cut from a heap when this is `Some`.
@@ -189,45 +184,31 @@ pub(crate) fn buffer_heap_len(size: u64) -> Option<u64> {
 }
 
 /// The grid, in bytes, windows of asks that give a length are cut on.
-/// Unset on a tight machine is 1 MiB. `VICTORY_WINDOW_KB` is a power of two
-/// from 64 KiB to 4 MiB; anything else is the 4 MiB grid.
+/// Unset is 4 MiB. `VICTORY_WINDOW_KB` is a power of two from 64 KiB to
+/// 4 MiB; anything else is the 4 MiB grid.
 ///
-/// Run 60's gameplay held 803 windows, 3.3 GB, and everything ever asked for
-/// in them lay within 1.6 GB: a 4 MiB window commits the whole cell however
-/// little of it a draw reads. 1 MiB ends the window nearer to the ask. 256
-/// KiB was measured the other way (more windows made and let go, more bytes
-/// copied) and is not the default. An ask with no length keeps the 4 MiB
-/// cell; [`window_tails_on`] drops the part of that cell below the ask.
-pub(crate) fn window_grid_bytes(raw: Option<&str>, tight: bool) -> u64 {
+/// A finer grid was tried on the 16 GB laptop (1 MiB, with tails). Private
+/// RAM rose from 17.3 GB to 18.5 GB and prison-cell frames went from 255 ms
+/// to 571 ms, with 5–8 s stalls that removed the device. More windows were
+/// made, copied, and let go. The stable layout is one 4 MiB window a cell.
+pub(crate) fn window_grid_bytes(raw: Option<&str>) -> u64 {
     const WINDOW: u64 = 4 << 20;
     let Some(raw) = raw.map(str::trim) else {
-        return if tight { 1 << 20 } else { WINDOW };
+        return WINDOW;
     };
     match raw.parse::<u64>().ok() {
         Some(kb) if kb.is_power_of_two() && (64..=4096).contains(&kb) => kb << 10,
-        // Set, but not a grid we cut on: the 4 MiB cells, tight machine or not.
         _ => WINDOW,
     }
 }
 
 /// Whether an ask with no length keeps only the tail of its 4 MiB cell
-/// (`VICTORY_WINDOW_TAILS`). Unset on a tight machine is on: the bytes below
-/// the lowest address asked for in the cell are never read (run 65: 513 of
-/// 782 windows, 2,052 MB, were such asks). `0` / `off` keeps the whole cell.
-pub(crate) fn window_tails_on(raw: Option<&str>, tight: bool) -> bool {
-    match raw.map(str::trim) {
-        Some("1" | "on") => true,
-        Some("0" | "off") => false,
-        _ => tight,
-    }
-}
-
-/// Snapshot buffers kept for reuse, in bytes. The pool holds at most eight,
-/// and on a tight machine at most 128 MiB of them (512 otherwise): a small
-/// copy used to be handed the 174 MB buffer kept for the big heap, and the
-/// pool then grew to 1.4 GB.
-pub(crate) fn snapshot_pool_bytes(tight: bool) -> usize {
-    if tight { 128 << 20 } else { 512 << 20 }
+/// (`VICTORY_WINDOW_TAILS=1`). Off unless set. On a 4 MiB grid a sized ask
+/// in the same cell still makes the whole cell, so a tail is a second
+/// window of the same bytes. The laptop run that turned tails on with a
+/// 1 MiB grid committed more and stalled.
+pub(crate) fn window_tails_on(raw: Option<&str>) -> bool {
+    matches!(raw.map(str::trim), Some("1" | "on"))
 }
 
 /// Bytes in one shared texture heap (`VICTORY_TEXTURE_HEAP_MB`, default 64,
@@ -508,13 +489,12 @@ mod tests {
     }
 
     #[test]
-    fn a_tight_machine_shares_buffer_heaps_and_cuts_windows_nearer_the_ask() {
-        assert!(!buffer_heaps_on(None, false));
-        assert!(buffer_heaps_on(None, true));
-        assert!(!buffer_heaps_on(Some("0"), true));
-        assert!(!buffer_heaps_on(Some("off"), true));
-        assert!(buffer_heaps_on(Some("1"), false));
-        assert!(buffer_heaps_on(Some("on"), false));
+    fn windows_stay_4_mib_unless_a_grid_is_named() {
+        assert!(!buffer_heaps_on(None));
+        assert!(!buffer_heaps_on(Some("0")));
+        assert!(!buffer_heaps_on(Some("off")));
+        assert!(buffer_heaps_on(Some("1")));
+        assert!(buffer_heaps_on(Some("on")));
 
         assert_eq!(buffer_heap_len(256), None);
         assert_eq!(buffer_heap_len((64 << 10) - 1), None);
@@ -524,19 +504,17 @@ mod tests {
         assert_eq!(buffer_heap_len((16 << 20) + (64 << 10)), None);
         assert_eq!(buffer_heap_len((1 << 20) + 256), None);
 
-        assert_eq!(window_grid_bytes(None, false), 4 << 20);
-        assert_eq!(window_grid_bytes(None, true), 1 << 20);
-        assert_eq!(window_grid_bytes(Some("4096"), true), 4 << 20);
-        assert_eq!(window_grid_bytes(Some("256"), false), 256 << 10);
-        assert_eq!(window_grid_bytes(Some("nope"), true), 4 << 20);
+        assert_eq!(window_grid_bytes(None), 4 << 20);
+        assert_eq!(window_grid_bytes(Some("4096")), 4 << 20);
+        assert_eq!(window_grid_bytes(Some("1024")), 1 << 20);
+        assert_eq!(window_grid_bytes(Some("256")), 256 << 10);
+        assert_eq!(window_grid_bytes(Some("nope")), 4 << 20);
 
-        assert!(!window_tails_on(None, false));
-        assert!(window_tails_on(None, true));
-        assert!(!window_tails_on(Some("0"), true));
-        assert!(window_tails_on(Some("1"), false));
-
-        assert_eq!(snapshot_pool_bytes(false), 512 << 20);
-        assert_eq!(snapshot_pool_bytes(true), 128 << 20);
+        assert!(!window_tails_on(None));
+        assert!(!window_tails_on(Some("0")));
+        assert!(!window_tails_on(Some("off")));
+        assert!(window_tails_on(Some("1")));
+        assert!(window_tails_on(Some("on")));
     }
 
     #[test]
