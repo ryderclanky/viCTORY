@@ -778,6 +778,12 @@ struct Views {
     /// The shapes of views of placed memory, and where each is.
     shapes: Vec<Shape>,
     shape_index: std::collections::BTreeMap<Shape, u32>,
+    /// Table entries of views no resource owns (a placed view or a constant
+    /// buffer view that did not fit in its record), oldest first, with the
+    /// generation they were noted at. Past [`ownerless_cap`] the oldest is
+    /// freed so the table cannot grow without a bound.
+    ownerless: std::collections::VecDeque<(u32, u32)>,
+    ownerless_live: usize,
 }
 
 /// Read far more often than written: every slot a draw reads through a
@@ -791,6 +797,8 @@ static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
     free: Vec::new(),
     shapes: Vec::new(),
     shape_index: std::collections::BTreeMap::new(),
+    ownerless: std::collections::VecDeque::new(),
+    ownerless_live: 0,
 });
 const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
 
@@ -874,13 +882,74 @@ fn constant_of(i: u32, generation: u32) -> View {
     View::Constant(payload & ((1 << CONSTANT_ADDRESS_BITS) - 1), size)
 }
 
-/// A placed view's shape and its address.
+/// How many words of the view-description union a dimension writes.
+/// Shader views: the union starts at word 4 (word 3 is alignment padding).
+/// Unordered views: the union starts at word 2.
+fn placed_union_words(unordered: bool, dimension: u32) -> usize {
+    if unordered {
+        match dimension {
+            1 => 7, // buffer: two address words, counts, counter, flags
+            2 | 6 => 1,
+            3 => 3,
+            4 | 7 => 2,
+            5 => 4,
+            8 => 3,
+            _ => 0,
+        }
+    } else {
+        match dimension {
+            1 => 5,
+            2 | 8 | 9 => 3,
+            3 | 10 => 5,
+            4 => 4,
+            5 => 6,
+            6 => 1,
+            7 | 11 => 2,
+            _ => 0,
+        }
+    }
+}
+
+/// Zeros the words a placed view does not write, so two views of one
+/// texture that differ only in stack filler share a shape.
+///
+/// The resource description's words 1 and 13 are the filler around
+/// `Alignment` and at the end of the 56-byte description (`resource.rs`
+/// keeps them out of a texture's key the same way). A shader view's word
+/// 3 is the padding before its union; the union words the dimension does
+/// not write, and the four words after the address, are filler too.
+/// `VICTORY_PLACED_FILLER=1` keeps the resource filler in the key.
+pub(crate) fn settle_placed(unordered: bool, resource: &mut [u32; 14], desc: &mut [u32; 16]) {
+    static KEPT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*KEPT.get_or_init(|| std::env::var_os("VICTORY_PLACED_FILLER").is_some_and(|v| v == "1")) {
+        resource[1] = 0;
+        resource[13] = 0;
+    }
+    let start = if unordered { 2 } else { 4 };
+    if !unordered {
+        desc[3] = 0;
+    }
+    let used = placed_union_words(unordered, desc[1]);
+    for word in desc.iter_mut().take(10).skip(start + used) {
+        *word = 0;
+    }
+    desc[12] = 0;
+    desc[13] = 0;
+    desc[14] = 0;
+    desc[15] = 0;
+}
+
+/// A placed view's shape and its address. The shape is the settled form
+/// ([`settle_placed`]): filler is not part of the key.
 fn shape_of(unordered: bool, resource: &[u32; 14], desc: &[u32; 16]) -> (Shape, u64) {
+    let mut resource = *resource;
+    let mut desc = *desc;
+    settle_placed(unordered, &mut resource, &mut desc);
     let mut rest = [0u32; 14];
     rest[..10].copy_from_slice(&desc[..10]);
     rest[10..].copy_from_slice(&desc[12..]);
     (
-        (unordered, *resource, rest),
+        (unordered, resource, rest),
         u64::from(desc[10]) | u64::from(desc[11]) << 32,
     )
 }
@@ -932,6 +1001,9 @@ impl Views {
         let i = match self.index.get(&view) {
             Some(&i) => i,
             None => {
+                if view_is_ownerless(&view) {
+                    self.evict_ownerless_to(ownerless_cap().saturating_sub(1));
+                }
                 let i = match self.free.pop() {
                     Some(i) => {
                         self.list[i as usize].0 = view.clone();
@@ -946,11 +1018,64 @@ impl Views {
                     self.by_resource.entry(r).or_default().push(i);
                 }
                 self.index.insert(view, i);
+                self.note_ownerless(i);
                 i
             }
         };
         [i, self.list[i as usize].1]
     }
+
+    fn note_ownerless(&mut self, i: u32) {
+        let (view, generation) = &self.list[i as usize];
+        if view_is_ownerless(view) {
+            self.ownerless.push_back((i, *generation));
+            self.ownerless_live += 1;
+        }
+    }
+
+    /// Frees the oldest ownerless entries until at most `cap` remain.
+    fn evict_ownerless_to(&mut self, cap: usize) {
+        while self.ownerless_live > cap {
+            let Some((i, generation)) = self.ownerless.pop_front() else {
+                self.ownerless_live = 0;
+                break;
+            };
+            let Some((view, seen)) = self.list.get(i as usize) else {
+                continue;
+            };
+            if *seen != generation || !view_is_ownerless(view) {
+                continue;
+            }
+            if self.index.get(view) != Some(&i) {
+                continue;
+            }
+            let view = view.clone();
+            self.index.remove(&view);
+            let generation = self.list[i as usize].1;
+            self.list[i as usize].1 = ((generation + 1) & GENERATIONS).max(1);
+            self.free.push(i);
+            self.ownerless_live -= 1;
+        }
+    }
+}
+
+/// A placed view or a constant buffer view: no resource object owns it, so
+/// releasing a resource never frees its table entry.
+fn view_is_ownerless(view: &View) -> bool {
+    matches!(view, View::Placed(..) | View::Constant(..))
+}
+
+/// How many ownerless table entries are kept (`VICTORY_OWNERLESS_VIEWS`,
+/// default 1_000_000). NVIDIA's view heap is that large; past it a new
+/// entry is refused by the driver.
+fn ownerless_cap() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("VICTORY_OWNERLESS_VIEWS")
+            .ok()
+            .and_then(|raw| raw.trim().parse().ok())
+            .unwrap_or(1_000_000)
+    })
 }
 
 /// The two words that name `view` in a record: the view itself where its
@@ -966,7 +1091,10 @@ fn words_for(view: View) -> [u32; 2] {
                 }
             }
             View::Placed(unordered, resource, desc) => {
-                let (shape, address) = shape_of(*unordered, resource, desc);
+                let (mut resource, mut desc) = (*resource, *desc);
+                settle_placed(*unordered, &mut resource, &mut desc);
+                let view = View::Placed(*unordered, resource, desc);
+                let (shape, address) = shape_of(*unordered, &resource, &desc);
                 if address >> PLACED_ADDRESS_BITS == 0 {
                     // Nearly every placed view has a shape seen before.
                     let known = views_read().shape_index.get(&shape).copied();
@@ -976,11 +1104,16 @@ fn words_for(view: View) -> [u32; 2] {
                         return placed_words(shape, address);
                     }
                 }
+                return words_of_entry(view);
             }
             _ => {}
         }
     }
-    // A view written before keeps its entry and generation.
+    words_of_entry(view)
+}
+
+/// A view written before keeps its entry and generation.
+fn words_of_entry(view: View) -> [u32; 2] {
     if let Some(words) = views_read().entry_of(&view) {
         return words;
     }
@@ -1849,9 +1982,11 @@ mod tests {
         // A resource description and a view no other test uses.
         let resource: [u32; 14] = std::array::from_fn(|k| 0x5ee0_0000 + k as u32);
         let mut desc: [u32; 16] = std::array::from_fn(|k| 0x7a70_0000 + k as u32);
+        let mut settled_resource = resource;
+        settle_placed(false, &mut settled_resource, &mut desc.clone());
         let mine = |v: &View| match v {
             View::Constant(address, _) => (0x6_0000_0000..0x6_1000_0000).contains(address),
-            View::Placed(_, r, _) => *r == resource,
+            View::Placed(_, r, _) => *r == resource || *r == settled_resource,
             _ => false,
         };
         let entries = || {
@@ -1869,8 +2004,14 @@ mod tests {
                 .unwrap()
                 .shapes
                 .iter()
-                .filter(|s| s.1 == resource)
+                .filter(|s| s.1 == settled_resource)
                 .count()
+        };
+        let settled = |unordered: bool, desc: [u32; 16]| {
+            let mut resource = settled_resource;
+            let mut desc = desc;
+            settle_placed(unordered, &mut resource, &mut desc);
+            View::Placed(unordered, resource, desc)
         };
         for n in 0..20_000u64 {
             let address = 0x6_0000_0000 + n * 0x100;
@@ -1879,18 +2020,18 @@ mod tests {
             let placed = 0xd_4940_0000 + n * 0x1_0000;
             (desc[10], desc[11]) = (placed as u32, (placed >> 32) as u32);
             create_placed_srv(null, &resource, &desc, at);
-            assert_eq!(view(at), Some(View::Placed(false, resource, desc)));
+            assert_eq!(view(at), Some(settled(false, desc)));
         }
         assert_eq!(entries(), 0, "no table entries");
         assert_eq!(shapes(), 1, "one shape for 20,000 placed views");
         // The same shape, unordered: another shape.
         create_placed_uav(null, &resource, &desc, at);
-        assert_eq!(view(at), Some(View::Placed(true, resource, desc)));
+        assert_eq!(view(at), Some(settled(true, desc)));
         assert_eq!(shapes(), 2);
         // Placed memory past 1 TiB (not title memory) is a table entry.
         (desc[10], desc[11]) = (0, 0x100);
         create_placed_srv(null, &resource, &desc, at);
-        assert_eq!(view(at), Some(View::Placed(false, resource, desc)));
+        assert_eq!(view(at), Some(settled(false, desc)));
         assert_eq!(entries(), 1);
         // A record's words are the same for the same view (the host knows
         // a slot's view by them), and differ with the address.
@@ -1902,6 +2043,76 @@ mod tests {
         assert_eq!(words(at), words(other.as_ptr() as u64));
         create_cbv(null, &[0x140, 6, 512, 0], other.as_ptr() as u64);
         assert_ne!(words(at), words(other.as_ptr() as u64));
+    }
+
+    /// Filler in the resource description and unused union words are not
+    /// part of a placed view's shape: two views that differ only there are
+    /// one shape.
+    #[test]
+    fn placed_view_filler_does_not_make_a_new_shape() {
+        if !inline() {
+            return;
+        }
+        let null = std::ptr::null();
+        let slots = [0u64; 4];
+        let at = slots.as_ptr() as u64;
+        // A buffer shader view: dimension 1, union words after the five
+        // the buffer writes are filler, as is resource word 1 and 13.
+        let mut resource = [0u32; 14];
+        resource[0] = 1;
+        resource[4] = 4096;
+        let mut desc = [0u32; 16];
+        desc[1] = 1;
+        desc[4] = 0;
+        desc[6] = 64;
+        let shapes_of = |resource: [u32; 14]| {
+            VIEWS
+                .read()
+                .unwrap()
+                .shapes
+                .iter()
+                .filter(|s| s.1[0] == 1 && s.1[4] == resource[4] && s.1[2] == resource[2])
+                .count()
+        };
+        let before = shapes_of(resource);
+        create_placed_srv(null, &resource, &desc, at);
+        resource[1] = 0x1111_1111;
+        resource[13] = 0x2222_2222;
+        desc[3] = 0x3333_3333;
+        desc[9] = 0x4444_4444;
+        desc[15] = 0x5555_5555;
+        create_placed_srv(null, &resource, &desc, at);
+        assert_eq!(shapes_of(resource), before + 1, "filler is one shape");
+        let View::Placed(_, kept, kept_desc) = view(at).unwrap() else {
+            panic!("a placed view");
+        };
+        assert_eq!(kept[1], 0);
+        assert_eq!(kept[13], 0);
+        assert_eq!(kept_desc[3], 0);
+        assert_eq!(kept_desc[9], 0);
+        assert_eq!(kept_desc[15], 0);
+        assert_eq!(kept_desc[6], 64, "a word the buffer view writes stays");
+    }
+
+    /// Ownerless table entries (placed views that do not fit in a record)
+    /// are freed down to a cap instead of growing without a bound.
+    #[test]
+    fn ownerless_placed_entries_are_capped() {
+        let null = std::ptr::null();
+        let slots = [0u64; 4];
+        let at = slots.as_ptr() as u64;
+        let resource = [0x61u32; 14];
+        let mut desc = [0u32; 16];
+        // Past 1 TiB: a table entry, not a shape.
+        desc[11] = 0x200;
+        let before = VIEWS.read().unwrap().ownerless_live;
+        for n in 0..6u32 {
+            desc[0] = 0x6100_0000 + n;
+            create_placed_srv(null, &resource, &desc, at);
+        }
+        assert!(VIEWS.read().unwrap().ownerless_live >= before + 6);
+        VIEWS.write().unwrap().evict_ownerless_to(before);
+        assert!(VIEWS.read().unwrap().ownerless_live <= before);
     }
 
     /// A released resource's views go stale; the same view of a new

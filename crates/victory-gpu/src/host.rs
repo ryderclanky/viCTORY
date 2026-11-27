@@ -79,11 +79,16 @@ static RETIRED: Mutex<Vec<(u64, Retired)>> = Mutex::new(Vec::new());
 static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Microseconds of a submission's preparing by part, since the frame-rate
-/// line last took them: the asking and the look under flights, the lists'
-/// steps, the flush of refreshes, the snapshots and the wait for card
-/// results, `card_before`, the hand-over to the card. An instrument: the
-/// frame line's "preparing" had 19 to 23 ms a frame no line split (run 282).
+/// Microseconds of a submission's preparing by part, from the start and
+/// never reset: the asking and the look under flights, the lists' steps,
+/// the flush of refreshes, the snapshots and the wait for card results,
+/// `card_before`, the hand-over to the card. An instrument: the frame
+/// line's "preparing" had 19 to 23 ms a frame no line split (run 282).
+///
+/// The frame-rate line used to swap these to zero. The per-frame line then
+/// subtracted its previous reading from a small new total and wrapped
+/// (34 of 103 gameplay frames on the laptop). Both readers take a
+/// saturating difference from their own last reading.
 static PREP_PARTS: [std::sync::atomic::AtomicU64; 6] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 6];
 
@@ -5221,8 +5226,15 @@ fn late_line(frames: f64) {
         );
     }
     {
-        let parts = [0, 1, 2, 3, 4, 5]
-            .map(|i| PREP_PARTS[i].swap(0, Ordering::Relaxed) as f64 / 1e3 / frames);
+        // Last totals this line reported. Not swapped to zero: the per-frame
+        // line reads the same counters, and a reset made its difference wrap.
+        static PREP_SAID: [std::sync::atomic::AtomicU64; 6] =
+            [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+        let parts = [0, 1, 2, 3, 4, 5].map(|i| {
+            let now = PREP_PARTS[i].load(Ordering::Relaxed);
+            let then = PREP_SAID[i].swap(now, Ordering::Relaxed);
+            now.saturating_sub(then) as f64 / 1e3 / frames
+        });
         tracing::info!(
             "a submission's preparing by part, ms per frame: the write-watch asking and the look for title bytes under flights \
              (settles for them included) {:.1}; the lists' steps (title copies, fills, preludes; refreshes are only noted) {:.1}; \
@@ -6669,15 +6681,23 @@ impl Host {
                     // title's either way.
                     let after = second.order_done();
                     let copy = second.down.list()?;
-                    for (shadow, lo, hi, at) in &pieces {
-                        copy.1.CopyBufferRegion(
-                            &buffer,
-                            *at,
-                            &shadow.buffer,
-                            *lo as u64,
-                            (*hi - *lo) as u64,
-                        );
-                    }
+                    // Abutting pieces of one buffer are one copy. The
+                    // destination stays packed as the pieces were, so the
+                    // merge below still reads each piece at its offset.
+                    for_coalesced_copies(
+                        &pieces,
+                        |(shadow, _, _, _)| std::sync::Arc::as_ptr(shadow) as usize,
+                        |(_, lo, hi, at)| (*lo, *hi, *at),
+                        |(shadow, _, _, _), lo, hi, at| {
+                            copy.1.CopyBufferRegion(
+                                &buffer,
+                                at,
+                                &shadow.buffer,
+                                lo as u64,
+                                (hi - lo) as u64,
+                            );
+                        },
+                    );
                     let job = second.down.send(copy, &[(&self.fence, behind)], total)?;
                     second.down.wait(job, event)?;
                     if beside {
@@ -6704,15 +6724,20 @@ impl Host {
                 }
                 allocator.Reset()?;
                 list.Reset(&allocator, None)?;
-                for (shadow, lo, hi, at) in &pieces {
-                    list.CopyBufferRegion(
-                        &buffer,
-                        *at,
-                        &shadow.buffer,
-                        *lo as u64,
-                        (*hi - *lo) as u64,
-                    );
-                }
+                for_coalesced_copies(
+                    &pieces,
+                    |(shadow, _, _, _)| std::sync::Arc::as_ptr(shadow) as usize,
+                    |(_, lo, hi, at)| (*lo, *hi, *at),
+                    |(shadow, _, _, _), lo, hi, at| {
+                        list.CopyBufferRegion(
+                            &buffer,
+                            at,
+                            &shadow.buffer,
+                            lo as u64,
+                            (hi - lo) as u64,
+                        );
+                    },
+                );
                 list.Close()?;
                 let lists = [Some(list.cast::<ID3D12CommandList>()?)];
                 // In the order of the queue: the sends of title bytes so
@@ -7046,11 +7071,9 @@ impl Host {
                 lists,
                 settling,
                 poke,
-                landed: kept,
                 in_hand,
                 ..
             } = &mut *line;
-            kept.extend(landed);
             in_hand.clear();
             // What is still in the air, from the flights that are.
             written.clear();
@@ -7065,9 +7088,12 @@ impl Host {
             }
             join_ranges(written, ranges);
             *settling = false;
-            // The landed lists are reset, and what queues hold looked at,
-            // by the helper thread (they take locks a waiter may hold).
+            // Queues are still looked at by the helper. The lists themselves
+            // are reset here: their dynamic slots are free for the next frame.
             *poke = true;
+        }
+        for (lists, order) in landed {
+            crate::list::recycle(lists, &order);
         }
         LINE_MOVED.notify_all();
         LINE_LANDED.notify_all();
@@ -7141,15 +7167,20 @@ impl Host {
                     // relay uses, in the plainest run there is.
                     if let Some(second) = crate::queue2::second().filter(|s| s.fetches()) {
                         let copy = second.down.list()?;
-                        for &(i, lo, hi, at) in &pieces {
-                            copy.1.CopyBufferRegion(
-                                fetched,
-                                at,
-                                &plan.ranges[i].shadow.buffer,
-                                lo as u64,
-                                (hi - lo) as u64,
-                            );
-                        }
+                        for_coalesced_copies(
+                            &pieces,
+                            |&(i, _, _, _)| std::sync::Arc::as_ptr(&plan.ranges[i].shadow) as usize,
+                            |&(_, lo, hi, at)| (lo, hi, at),
+                            |&(i, _, _, _), lo, hi, at| {
+                                copy.1.CopyBufferRegion(
+                                    fetched,
+                                    at,
+                                    &plan.ranges[i].shadow.buffer,
+                                    lo as u64,
+                                    (hi - lo) as u64,
+                                );
+                            },
+                        );
                         let job = second
                             .down
                             .send(copy, &[(&self.fence, *submitted)], total)?;
@@ -7166,15 +7197,20 @@ impl Host {
                     }
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
-                    for &(i, lo, hi, at) in &pieces {
-                        list.CopyBufferRegion(
-                            fetched,
-                            at,
-                            &plan.ranges[i].shadow.buffer,
-                            lo as u64,
-                            (hi - lo) as u64,
-                        );
-                    }
+                    for_coalesced_copies(
+                        &pieces,
+                        |&(i, _, _, _)| std::sync::Arc::as_ptr(&plan.ranges[i].shadow) as usize,
+                        |&(_, lo, hi, at)| (lo, hi, at),
+                        |&(i, _, _, _), lo, hi, at| {
+                            list.CopyBufferRegion(
+                                fetched,
+                                at,
+                                &plan.ranges[i].shadow.buffer,
+                                lo as u64,
+                                (hi - lo) as u64,
+                            );
+                        },
+                    );
                     list.Close()?;
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                     self.card_sent();
@@ -10086,9 +10122,16 @@ fn refresh_once() -> bool {
     }
 }
 
-/// A submission's refreshes not done yet, merged per buffer copy into the
-/// range that covers them: done before a step that writes title memory or
-/// gives a range to shaders, and before the lists run.
+/// A submission's refreshes not done yet, one entry per buffer copy, its
+/// ranges joined where they overlap or touch and not across a gap: done
+/// before a step that writes title memory or gives a range to shaders, and
+/// before the lists run.
+///
+/// A single covering range copied every page between two asks, including
+/// pages no refresh named and that the copy had never taken. On the laptop
+/// that was most of the copies stage (about 237 MB a frame) once windows
+/// were made again each frame. A gap stays a gap. The bytes of each ask
+/// are still brought up to date.
 ///
 /// Also the textures brought up to date in the submission so far: most
 /// lists of a world submission sample the same textures, and a texture in
@@ -10096,7 +10139,7 @@ fn refresh_once() -> bool {
 /// once, it is checked again only after a step that writes title memory.
 #[derive(Default)]
 struct Batch {
-    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)>,
     /// Where each copy (by address) is in `refreshes`: the list that makes
     /// the heap's buffers ready adds some 4,100 copies, and searching them
     /// for every refresh of a submission was tens of millions of
@@ -10120,6 +10163,30 @@ struct Batch {
     texture_spans: std::collections::HashMap<usize, (usize, usize)>,
 }
 
+/// One copy per [`crate::laptop::coalesce_groups`] group of `pieces`. `copy`
+/// is given the first piece of the group, the source start, the source end
+/// and the destination of that piece: the bytes through the group's last
+/// source end.
+fn for_coalesced_copies<T>(
+    pieces: &[T],
+    key: impl Fn(&T) -> usize,
+    span: impl Fn(&T) -> (usize, usize, u64),
+    mut copy: impl FnMut(&T, usize, usize, u64),
+) {
+    let keyed: Vec<(usize, usize, usize, u64)> = pieces
+        .iter()
+        .map(|piece| {
+            let (lo, hi, at) = span(piece);
+            (key(piece), lo, hi, at)
+        })
+        .collect();
+    for group in crate::laptop::coalesce_groups(&keyed) {
+        let (_, lo, _, at) = keyed[group.start];
+        let hi = keyed[group.end - 1].2;
+        copy(&pieces[group.start], lo, hi, at);
+    }
+}
+
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
@@ -10137,14 +10204,14 @@ impl Batch {
             }
             return;
         }
-        match self.index.get(&key) {
-            Some(&at) => {
-                let r = &mut self.refreshes[at];
-                (r.1, r.2) = (r.1.min(address), r.2.max(end));
-            }
+        if address >= end {
+            return;
+        }
+        match self.index.get(&key).copied() {
+            Some(at) => crate::laptop::admit_range(&mut self.refreshes[at].1, address, end),
             None => {
                 self.index.insert(key, self.refreshes.len());
-                self.refreshes.push((shadow.clone(), address, end));
+                self.refreshes.push((shadow.clone(), vec![(address, end)]));
             }
         }
     }
@@ -10158,14 +10225,16 @@ impl Batch {
         else {
             return;
         };
-        let (shadow, from, to) = self.refreshes.swap_remove(at);
+        let (shadow, ranges) = self.refreshes.swap_remove(at);
         // The last entry took its place.
         if let Some(moved) = self.refreshes.get(at) {
             self.index
                 .insert(std::sync::Arc::as_ptr(&moved.0) as usize, at);
         }
-        Self::update(&shadow, from, to);
-        Self::brought(&mut self.current, &shadow, from, to);
+        for (from, to) in ranges {
+            Self::update(&shadow, from, to);
+            Self::brought(&mut self.current, &shadow, from, to);
+        }
     }
 
     /// With [`refresh_once`]: `[from, to)` of `shadow`'s copy was brought
@@ -10289,10 +10358,21 @@ impl Batch {
         }
         let touches = |from: usize, to: usize| written.iter().any(|&(a, b)| from < b && a < to);
         // The refreshes that hold written bytes: done now, before the write.
+        // One copy's ranges stay together: a range that does not touch is
+        // still that copy's, and flushing the copy's touching ranges first
+        // is what the write waits for.
         let pending = std::mem::take(&mut self.refreshes);
-        let (due, keep): (Vec<_>, Vec<_>) = pending.into_iter().partition(|r| touches(r.1, r.2));
-        NEAR[3].fetch_add(due.len() as u64, Relaxed);
-        NEAR[4].fetch_add(keep.len() as u64, Relaxed);
+        let (due, keep): (Vec<_>, Vec<_>) = pending
+            .into_iter()
+            .partition(|(_, ranges)| ranges.iter().any(|&(from, to)| touches(from, to)));
+        NEAR[3].fetch_add(
+            due.iter().map(|(_, ranges)| ranges.len() as u64).sum(),
+            Relaxed,
+        );
+        NEAR[4].fetch_add(
+            keep.iter().map(|(_, ranges)| ranges.len() as u64).sum(),
+            Relaxed,
+        );
         if !due.is_empty() {
             self.refreshes = due;
             self.flush();
@@ -10385,14 +10465,15 @@ impl Batch {
         self.index.clear();
         // One write-watch asking for the copies that lie close together,
         // not one per copy.
-        let ahead = self.refreshes.len() > 1;
+        let ahead =
+            self.refreshes.iter().any(|(_, ranges)| ranges.len() > 1) || self.refreshes.len() > 1;
         if ahead {
             let started = std::time::Instant::now();
             let ranges: Vec<(usize, usize)> = self
                 .refreshes
                 .iter()
                 .filter(|r| !r.0.unwatched())
-                .map(|r| (r.1, r.2))
+                .flat_map(|r| r.1.iter().copied())
                 .collect();
             crate::watch::ask_ahead(&ranges);
             preparing(0, started.elapsed().as_micros() as u64);
@@ -10401,17 +10482,24 @@ impl Batch {
             // Each copy on its own, several at a time: a copy's refresh
             // writes that copy and reads title memory, nothing of another's.
             // The time counted is the time it took, not the threads' sum.
+            // One copy's ranges stay on one thread: they share its locks.
             let started = std::time::Instant::now();
             let before = PREPARING[0].load(Ordering::Relaxed);
             // Noted now: nothing reads the notes before the jobs are done.
-            for (shadow, from, to) in &self.refreshes {
-                Self::brought(&mut self.current, shadow, *from, *to);
+            for (shadow, ranges) in &self.refreshes {
+                for &(from, to) in ranges {
+                    Self::brought(&mut self.current, shadow, from, to);
+                }
             }
             let jobs: Vec<Box<dyn FnOnce() + Send>> = self
                 .refreshes
                 .drain(..)
-                .map(|(shadow, from, to)| {
-                    Box::new(move || Self::update(&shadow, from, to)) as Box<dyn FnOnce() + Send>
+                .map(|(shadow, ranges)| {
+                    Box::new(move || {
+                        for (from, to) in ranges {
+                            Self::update(&shadow, from, to);
+                        }
+                    }) as Box<dyn FnOnce() + Send>
                 })
                 .collect();
             crate::shadow::wide_run(jobs);
@@ -10420,9 +10508,11 @@ impl Batch {
             PREPARING[0].fetch_sub(over, Ordering::Relaxed);
             crate::framelog::sub(crate::framelog::T::CopyUs, over);
         } else {
-            for (shadow, from, to) in self.refreshes.drain(..) {
-                Self::update(&shadow, from, to);
-                Self::brought(&mut self.current, &shadow, from, to);
+            for (shadow, ranges) in self.refreshes.drain(..) {
+                for (from, to) in ranges {
+                    Self::update(&shadow, from, to);
+                    Self::brought(&mut self.current, &shadow, from, to);
+                }
             }
         }
         if ahead {

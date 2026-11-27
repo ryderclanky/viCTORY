@@ -1507,43 +1507,33 @@ mod relay_tests {
 }
 
 /// Snapshot memory kept for reuse (already touched, so no page faults).
-static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+/// One bucket per size class ([`crate::laptop::SnapshotPool`]): a small
+/// copy is not handed the buffer kept for the big heap, nothing is
+/// allocated while the lock is held, and the buckets are not sorted.
+static POOL: Mutex<crate::laptop::SnapshotPool> = Mutex::new(crate::laptop::SnapshotPool {
+    buckets: std::collections::BTreeMap::new(),
+    bytes: 0,
+});
 
-/// An empty buffer with room for `n` bytes, from the pool if it has one
-/// of about that size: a small copy's snapshot took the 174 MB buffer kept
-/// for the big heap's, which then got another, until eight of them were
-/// reserved (1.4 GB in run 24).
+/// An empty buffer with room for `n` bytes, from its size class in the
+/// pool. The allocation, when the class is empty, happens after the lock
+/// is let go.
 fn pooled(n: usize) -> Vec<u8> {
-    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    let most = n.saturating_mul(4).max(1 << 20);
-    let fit = pool
-        .iter()
-        .enumerate()
-        .filter(|(_, v)| v.capacity() >= n && v.capacity() <= most)
-        .min_by_key(|(_, v)| v.capacity())
-        .map(|(i, _)| i);
-    let mut v = match fit {
-        Some(i) => pool.swap_remove(i),
-        None => Vec::with_capacity(n),
+    let got = {
+        let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+        pool.take(n)
     };
-    v.clear();
-    v
+    got.unwrap_or_else(|| Vec::with_capacity(crate::laptop::snapshot_class(n).max(n)))
 }
 
-/// Returns a snapshot buffer to the pool: at most 8 kept, the largest, and
-/// of those the largest one and the next ones up to `KEPT` bytes in all.
+/// Returns a snapshot buffer to its size class. The cap follows the
+/// machine and the free RAM; one buffer of each class is kept past it.
 fn give_back(v: Vec<u8>) {
-    const KEPT: usize = 512 << 20;
+    let profile = crate::tuning::profile();
+    let tight = profile.levels_on_demand && profile.staging_mb <= 64;
+    let cap = crate::laptop::snapshot_pool_cap(tight, crate::host::available_physical_ram());
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    pool.push(v);
-    pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
-    pool.truncate(8);
-    let (mut seen, mut total) = (0, 0usize);
-    pool.retain(|v| {
-        seen += 1;
-        total = total.saturating_add(v.capacity());
-        seen == 1 || total <= KEPT
-    });
+    pool.give(v, cap);
 }
 
 const NOT_WATCHED: u8 = 2;
@@ -3218,10 +3208,7 @@ pub(crate) fn memory() -> [u64; 6] {
     };
     let (kept, kept_bytes) = {
         let pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-        (
-            pool.len() as u64,
-            pool.iter().map(|v| v.capacity() as u64).sum::<u64>(),
-        )
+        (pool.len() as u64, pool.bytes() as u64)
     };
     [
         LIVE[0].load(Ordering::Relaxed),
@@ -5258,7 +5245,8 @@ fn lookup_tables(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
 /// A window nothing names any more is let go ([`let_go_idle`]).
 /// shortcut: a window is 4 MiB however little of it is read (the memory
 /// line says how much was ever asked for, and how much was ever copied);
-/// [`window`] cuts the windows of asks that give a length on a finer grid.
+/// [`window`] cuts the windows of asks that give a length on a finer grid
+/// only when `VICTORY_WINDOW_KB` asks.
 const WINDOW: u64 = 4 << 20;
 
 /// The grid the windows of asks with a length are cut on, in bytes: 4 MiB
