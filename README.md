@@ -70,10 +70,10 @@ bytes and a few hundred megabytes of RAM free. Series X title memory alone is ab
 16 GB, so Windows still paged. A later preset that cut windows to 1 MiB,
 kept only their tails, and placed host copies in shared heaps made that worse
 on the same machine: 2 fps (571 ms), 18.5 GB private, and device removals
-after 5–8 s frames. Windows stay 4 MiB. The switches below are off unless
-set, except shared texture heaps, which follow the small-machine profile.
-`play.ps1` turns on the paths that were measured to help and leaves the
-ones that stalled off.
+after 5–8 s frames. Windows stay 4 MiB. Shared buffer heaps stay off: they
+commit 64 MiB whole. The switches below are off unless set, except shared
+texture heaps, which follow the small-machine profile. `play.ps1` turns on
+the paths that were measured to help and leaves the ones that stalled off.
 
 ```
 set VICTORY_CONSOLE=series-s
@@ -87,11 +87,12 @@ set VICTORY_HEAP_WORKER=1
 set VICTORY_LOOKUP_CACHE=1
 set VICTORY_SETTLE_ROOM=1
 set VICTORY_PARALLEL_REFRESH=1
-set VICTORY_NEAR_WRITES=1
-set VICTORY_REFRESH_ONCE=1
 set VICTORY_COPY_PLAIN=1
+set VICTORY_QUEUE2=1
+set VICTORY_POOL_SMALL=1
 set VICTORY_INPLACE=0
 set VICTORY_CARD_FETCH_INFLIGHT=0
+set VICTORY_VIEW_OWN_COPY=0
 victory run <game dir>\<the title's exe> --execute
 ```
 
@@ -118,19 +119,20 @@ still forces the larger console.
 | `VICTORY_LOOKUP_CACHE` | off; `play.ps1` sets `1` | A recording thread remembers which host copy an ask found until the buffer tables change. The six recording threads spent about 54 ms a frame together on that lock. |
 | `VICTORY_SETTLE_ROOM` | off; `play.ps1` sets `1` | Flights may hold twice as many lists, and a merge under shader writes gives up after eight times as many changed runs. Measured a few milliseconds of settles a frame at the boat. |
 | `VICTORY_PARALLEL_REFRESH` | off; `play.ps1` sets `1` | A submission's texture checks run side by side. Measured 11–12 ms of preparing at the boat, on the submitting thread before. |
-| `VICTORY_NEAR_WRITES` | off; `play.ps1` sets `1` | A title copy flushes only the refreshes it touches, instead of every pending refresh and every texture. Fitted at about 13 ms of steps and 5 ms of flush per 100 such copies. |
-| `VICTORY_REFRESH_ONCE` | off; `play.ps1` sets `1` | A range brought up to date in a submission is not copied again until a step writes title memory there. Measured 1,800–2,700 redundant refreshes a frame, 23–29 ms. |
 | `VICTORY_COPY_PLAIN` | off; `play.ps1` sets `1` | Copies of title memory into host buffers are `rep movsb`, and a missing page falls back to the kernel. The kernel path was 35 ms for about 100 MB; the processor's copy is about a third of that. |
-| `VICTORY_FRAME_TIMINGS` | off | `1` logs one line of stage times per presented frame. The six preparing parts are a running total, so a frame-rate line in the middle of a frame does not wrap them. |
+| `VICTORY_QUEUE2` | off; `play.ps1` sets `1` | Bit 1: fetches of what shaders wrote go on the copy engine and wait only for that flight. On the graphics queue the same fetch waits behind every later draw. Bit 2 (uploads) stays off. |
+| `VICTORY_POOL_SMALL` | on for the small profile; `play.ps1` sets `1` | Pooled plain textures the driver accepts at 4 KiB share a 4 KiB heap. Reserved textures stay at 64 KiB. |
+| `VICTORY_FRAME_TIMINGS` | off | `1` logs one line of stage times per presented frame, including `cb-alloc`, `cb-wait`, and `cb-merge` inside copy-back. The six preparing parts are a running total, so a frame-rate line in the middle of a frame does not wrap them. |
 | `VICTORY_AMBIENT` | off | After the screen-probe resolve, replace its indirect light with a constant in `0.0..=1.0` so shadowed geometry is visible while ray tracing stays off. `0.25` is the laptop preset; `0.6` is brighter and can glow in fog. |
 | `VICTORY_CONSOLE` | Series X | `series-s` gives the title the smaller console: device type, under 8 GiB of title memory (7,776 MiB), a 1280x720 render and a 1920x1080 present. The presented frame is the rendered colour drawn over the upscaler's output, because that upscaler's own passes do not translate. |
 | `VICTORY_INPLACE` | `0` | Stays off. Reading title memory in place was slower. |
+| `VICTORY_VIEW_OWN_COPY` | on; `play.ps1` sets `0` | A buffer view that misses its copy's elements gets a copy of its own bytes. `0` refuses it (the slot reads zeros) and does not take the lock those copies share. One line in `play.ps1`. |
 | `VICTORY_CARD_FETCH_INFLIGHT` | `0` | Stays off. It cut copy-back waits and made the card much busier. |
 | `VICTORY_BVH_BUILDER` | off | Ray tracing stays off. The ambient floor is the stand-in for the missing bounce light. |
 | `VICTORY_UPSCALE` | stand-in | `title` leaves Series S upscaling to the title's own passes, which do not translate, so the picture stays black. |
 | `VICTORY_UI_PLANE` | premultiplied | `0` leaves the title's interface plane out of the presented frame. `straight` blends it by straight alpha. |
 
-Series S is the memory cut on a 16 GB machine. Its title limit is 7,776 MiB, against about 13.5 GiB on Series X, and it draws a 720p picture into a 1080p present instead of a 1440p picture into a 4K one. The 21.5 GB private / 7.8 GB VRAM peak was the Series X profile with the switches above. A tighter texture cap than the small profile's is not applied: when the card was held under that cap, surfaces the title fills went untextured. `VICTORY_FRAME_TIMINGS=1` prints each frame's stages so the next run on the laptop can say which of them is still the slow one.
+Series S is the memory cut on a 16 GB machine. Its title limit is 7,776 MiB, against about 13.5 GiB on Series X, and it draws a 720p picture into a 1080p present instead of a 1440p picture into a 4K one. The 21.5 GB private / 7.8 GB VRAM peak was the Series X profile with the switches above. A tighter texture cap than the small profile's is not applied: when the card was held under that cap, surfaces the title fills went untextured. Windows stay 4 MiB. Snapshot buffers are reused by size class. Placed-view shapes ignore unwritten filler, and ownerless view-table entries stop at `VICTORY_OWNERLESS_VIEWS` (1,000,000). `VICTORY_FRAME_TIMINGS=1` prints each frame's stages, including `cb-alloc`, `cb-wait`, and `cb-merge`. `VICTORY_QUEUE2=1` puts the shader-write fetch on the copy engine, so it waits for that flight and not for later draws. The merge skips 4 KiB blocks the card left alone and, past 256 KiB, runs the rest on several threads. A settle is not counted in the asking part. Read-back buffers are reused, up to 48 MiB on a tight machine. A copy of 4 MiB or more into a host buffer runs on four threads. `VICTORY_POOL_SMALL` logs whether 4 KiB placement is in use.
 
 ## Status of this fork (2026-11-26, 11:50 UTC)
 

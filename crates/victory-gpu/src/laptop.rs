@@ -211,6 +211,293 @@ pub(crate) fn window_tails_on(raw: Option<&str>) -> bool {
     matches!(raw.map(str::trim), Some("1" | "on"))
 }
 
+/// Microseconds each preparing part advanced from `then` to `now`.
+///
+/// A part that reads lower than the last present saturates at zero. The
+/// frame-rate line used to zero those counters, and a wrapping subtraction
+/// then printed a multi-hour part (34 of 103 gameplay frames on the laptop).
+pub(crate) fn prep_delta(now: [u64; 6], then: [u64; 6]) -> [u64; 6] {
+    std::array::from_fn(|i| now[i].saturating_sub(then[i]))
+}
+
+/// Adds `[from, to)` to `ranges`, which stays sorted and holds no two
+/// ranges that overlap or touch. A gap of one byte or more is kept: those
+/// bytes were not asked for, and copying them filled pages the copy had
+/// never taken.
+pub(crate) fn admit_range(ranges: &mut Vec<(usize, usize)>, from: usize, to: usize) {
+    if from >= to {
+        return;
+    }
+    let i = ranges.partition_point(|&(_, end)| end < from);
+    let (mut from, mut to) = (from, to);
+    while i < ranges.len() && ranges[i].0 <= to {
+        from = from.min(ranges[i].0);
+        to = to.max(ranges[i].1);
+        ranges.remove(i);
+    }
+    ranges.insert(i, (from, to));
+}
+
+/// Groups of `pieces` `(key, source start, source end, destination)` that
+/// are one copy: the same key, sources that abut, and a destination packed
+/// against the piece before. The bytes are the same; one region is one
+/// command instead of one per 64 KiB piece of a copy-back.
+pub(crate) fn coalesce_groups<K: Eq>(
+    pieces: &[(K, usize, usize, u64)],
+) -> Vec<std::ops::Range<usize>> {
+    let mut groups = Vec::new();
+    let mut start = 0;
+    for i in 0..pieces.len() {
+        let prev = i.checked_sub(1).map(|p| &pieces[p]);
+        let join = prev.is_some_and(|prev| {
+            prev.2 >= prev.1
+                && pieces[i].0 == prev.0
+                && pieces[i].1 == prev.2
+                && pieces[i].3 == prev.3 + (prev.2 - prev.1) as u64
+        });
+        if !join {
+            if i > start {
+                groups.push(start..i);
+            }
+            start = i;
+        }
+    }
+    if start < pieces.len() {
+        groups.push(start..pieces.len());
+    }
+    groups
+}
+
+/// Bytes of snapshot buffers kept for reuse.
+///
+/// A tight machine keeps 128 MiB. Under memory pressure (under 2 GiB free)
+/// that falls to 64 MiB, and under 4 GiB free a large machine also stops
+/// at 128 MiB. Otherwise 512 MiB. One buffer of each size class is kept
+/// even past the cap, so the large heap's snapshot is not thrown away and
+/// allocated again (that allocation was the multi-second stall).
+pub(crate) fn snapshot_pool_cap(tight: bool, free_ram: Option<u64>) -> usize {
+    let base = if tight { 128 << 20 } else { 512 << 20 };
+    match free_ram {
+        Some(free) if free < 2 << 30 => 64 << 20,
+        Some(free) if free < 4 << 30 => base.min(128 << 20),
+        _ => base,
+    }
+}
+
+/// The size class of a snapshot of `n` bytes: the next power of two, and
+/// at least 4 KiB. A request and a buffer meet only in one class, so a
+/// small copy is not handed the buffer kept for the big heap.
+pub(crate) fn snapshot_class(n: usize) -> usize {
+    n.max(4096)
+        .checked_next_power_of_two()
+        .unwrap_or(usize::MAX)
+}
+
+/// Spare snapshot buffers, one bucket per [`snapshot_class`].
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SnapshotPool {
+    pub(crate) buckets: std::collections::BTreeMap<usize, Vec<Vec<u8>>>,
+    pub(crate) bytes: usize,
+}
+
+impl SnapshotPool {
+    /// Bytes kept. The memory line reads this; a build without that line
+    /// does not.
+    #[cfg_attr(not(any(test, feature = "diagnostics")), allow(dead_code))]
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// Buffers kept. The memory line reads this; a build without that line
+    /// does not.
+    #[cfg_attr(not(any(test, feature = "diagnostics")), allow(dead_code))]
+    pub(crate) fn len(&self) -> usize {
+        self.buckets.values().map(Vec::len).sum()
+    }
+
+    /// A spare buffer of at least `n` bytes from this request's class, or
+    /// `None`. The caller allocates outside the lock when this is `None`.
+    pub(crate) fn take(&mut self, n: usize) -> Option<Vec<u8>> {
+        let class = snapshot_class(n);
+        loop {
+            let mut v = self.buckets.get_mut(&class)?.pop()?;
+            self.bytes = self.bytes.saturating_sub(v.capacity());
+            if self.buckets.get(&class).is_some_and(Vec::is_empty) {
+                self.buckets.remove(&class);
+            }
+            if v.capacity() >= n {
+                v.clear();
+                return Some(v);
+            }
+        }
+    }
+
+    /// Keeps `v` when the pool is under `cap`, and always keeps the first
+    /// buffer of its class. Extras past `cap` are dropped, largest class
+    /// first, but never the last buffer of a class.
+    pub(crate) fn give(&mut self, v: Vec<u8>, cap: usize) {
+        if v.capacity() == 0 {
+            return;
+        }
+        let class = snapshot_class(v.capacity());
+        let bucket = self.buckets.entry(class).or_default();
+        let first_of_class = bucket.is_empty();
+        if !first_of_class && self.bytes.saturating_add(v.capacity()) > cap {
+            return;
+        }
+        self.bytes = self.bytes.saturating_add(v.capacity());
+        bucket.push(v);
+        self.trim(cap);
+    }
+
+    /// Drops spare buffers until `bytes` is within `cap` or every class
+    /// has a single buffer left.
+    pub(crate) fn trim(&mut self, cap: usize) {
+        while self.bytes > cap {
+            let Some(class) = self
+                .buckets
+                .iter()
+                .rev()
+                .find(|(_, bucket)| bucket.len() > 1)
+                .map(|(class, _)| *class)
+            else {
+                break;
+            };
+            let Some(v) = self.buckets.get_mut(&class).and_then(Vec::pop) else {
+                break;
+            };
+            self.bytes = self.bytes.saturating_sub(v.capacity());
+            if self.buckets.get(&class).is_some_and(Vec::is_empty) {
+                self.buckets.remove(&class);
+            }
+        }
+    }
+}
+
+/// Alignment a pooled plain texture is placed at.
+///
+/// `info_align` is what `GetResourceAllocationInfo` reported. 64 KiB is the
+/// heap the reserved-texture path also uses. 4 KiB is only for a resource
+/// the driver accepted at 4 KiB, and only when `small_on`
+/// (`VICTORY_POOL_SMALL`). Reserved textures do not come through here:
+/// [`reserved_alignment`] stays the default 64 KiB.
+pub(crate) fn pooled_texture_align(info_align: u64, small_on: bool) -> Option<u64> {
+    const K4: u64 = 4 << 10;
+    const K64: u64 = 64 << 10;
+    if info_align == K64 {
+        Some(K64)
+    } else if small_on && info_align == K4 {
+        Some(K4)
+    } else {
+        None
+    }
+}
+
+/// Bytes of read-back buffers kept for reuse. A tight machine keeps 48 MiB
+/// so an 8 GB card's system read-back does not grow without a bound.
+/// A larger machine keeps 256 MiB.
+pub(crate) fn readback_pool_bytes(tight: bool) -> u64 {
+    if tight { 48 << 20 } else { 256 << 20 }
+}
+
+/// Where `now` differs from `held`, both `title` and `held` take that byte
+/// of `now`. Every other byte stays. Returns whether `title` changed.
+///
+/// A byte the card wrote and the title already holds does not count as a
+/// change. The three slices are read up to the shortest of them.
+pub(crate) fn merge_changed(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
+    let n = now.len().min(held.len()).min(title.len());
+    let mut changed = false;
+    let mut i = 0;
+    // Equal 64-byte blocks are one compare (the compiler turns slice
+    // equality into a vector compare) and are not written.
+    while i + 64 <= n {
+        if now[i..i + 64] == held[i..i + 64] {
+            i += 64;
+            continue;
+        }
+        changed |= merge_words(&now[i..i + 64], &mut held[i..i + 64], &mut title[i..i + 64]);
+        i += 64;
+    }
+    if i < n {
+        changed |= merge_words(&now[i..n], &mut held[i..n], &mut title[i..n]);
+    }
+    changed
+}
+
+fn merge_words(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
+    let n = now.len().min(held.len()).min(title.len());
+    let mut changed = false;
+    let mut i = 0;
+    while i + 8 <= n {
+        let nw = load8(&now[i..]);
+        let hw = load8(&held[i..]);
+        let tw = load8(&title[i..]);
+        let mask = differing_bytes(nw ^ hw);
+        if mask != 0 {
+            let merged = (tw & !mask) | (nw & mask);
+            changed |= merged != tw;
+            store8(&mut held[i..], (hw & !mask) | (nw & mask));
+            store8(&mut title[i..], merged);
+        }
+        i += 8;
+    }
+    while i < n {
+        let wrote = if now[i] != held[i] { 0xff } else { 0 };
+        let merged = (title[i] & !wrote) | (now[i] & wrote);
+        changed |= merged != title[i];
+        held[i] = (held[i] & !wrote) | (now[i] & wrote);
+        title[i] = merged;
+        i += 1;
+    }
+    changed
+}
+
+/// How a merge cuts a fetched piece before it reads title memory. An equal
+/// block is not read and not written.
+pub(crate) const MERGE_BLOCK: usize = 4096;
+
+/// The runs of `block` bytes where `now` differs from `was`, adjacent runs
+/// joined, as (offset, bytes). A block is one slice compare. `block` of 0
+/// compares nothing.
+pub(crate) fn dirty_blocks(now: &[u8], was: &[u8], block: usize) -> Vec<(usize, usize)> {
+    let n = now.len().min(was.len());
+    if block == 0 || n == 0 {
+        return Vec::new();
+    }
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    let mut at = 0;
+    while at < n {
+        let len = block.min(n - at);
+        if now[at..at + len] != was[at..at + len] {
+            match out.last_mut() {
+                Some(last) if last.0 + last.1 == at => last.1 += len,
+                _ => out.push((at, len)),
+            }
+        }
+        at += len;
+    }
+    out
+}
+
+fn load8(s: &[u8]) -> u64 {
+    u64::from_ne_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]])
+}
+
+fn store8(s: &mut [u8], v: u64) {
+    s[..8].copy_from_slice(&v.to_ne_bytes());
+}
+
+/// Every byte of `xor` that is not zero, widened to `0xff`.
+fn differing_bytes(xor: u64) -> u64 {
+    let mut m = xor;
+    m |= m >> 1;
+    m |= m >> 2;
+    m |= m >> 4;
+    m &= 0x0101_0101_0101_0101;
+    m.wrapping_mul(0xff)
+}
+
 /// Bytes in one shared texture heap (`VICTORY_TEXTURE_HEAP_MB`, default 64,
 /// clamped to 32..=256). 256 MiB is what a 16 GB card used; an 8 GB card
 /// keeps a smaller heap so an empty tail is not a large part of its budget.
@@ -515,6 +802,181 @@ mod tests {
         assert!(!window_tails_on(Some("off")));
         assert!(window_tails_on(Some("1")));
         assert!(window_tails_on(Some("on")));
+
+        assert_eq!(snapshot_pool_cap(false, None), 512 << 20);
+        assert_eq!(snapshot_pool_cap(true, None), 128 << 20);
+        assert_eq!(snapshot_pool_cap(true, Some(8 << 30)), 128 << 20);
+        assert_eq!(snapshot_pool_cap(false, Some(3 << 30)), 128 << 20);
+        assert_eq!(snapshot_pool_cap(true, Some(1 << 30)), 64 << 20);
+        assert_eq!(snapshot_pool_cap(false, Some(1 << 30)), 64 << 20);
+    }
+
+    #[test]
+    fn a_snapshot_pool_reuses_a_class_and_keeps_one_past_the_cap() {
+        let mut pool = SnapshotPool::default();
+        let cap = 128 << 20;
+        let mut small = Vec::with_capacity(1 << 20);
+        small.extend_from_slice(&[1, 2, 3]);
+        pool.give(small, cap);
+        let again = pool.take(1 << 20).expect("the 1 MiB class");
+        assert!(again.capacity() >= 1 << 20);
+        assert!(again.is_empty(), "a reused snapshot is cleared");
+        pool.give(again, cap);
+
+        let huge = Vec::with_capacity(174 << 20);
+        pool.give(huge, cap);
+        assert!(
+            pool.take(64 << 10).is_none(),
+            "a small copy is not handed the big heap's buffer"
+        );
+        let huge = pool.take(174 << 20).expect("the large class");
+        assert!(huge.capacity() >= 174 << 20);
+        pool.give(huge, cap);
+        // Past the cap, extras of a class go; the last of each class stays.
+        pool.give(Vec::with_capacity(1 << 20), cap);
+        pool.give(Vec::with_capacity(1 << 20), cap);
+        pool.trim(0);
+        assert_eq!(pool.len(), 2, "one buffer of each class");
+        assert!(pool.bytes() > cap);
+        assert!(pool.take(1 << 20).is_some());
+        assert!(pool.take(174 << 20).is_some());
+    }
+
+    #[test]
+    fn a_preparing_part_that_goes_backwards_saturates_instead_of_wrapping() {
+        // A frame-rate line that zeroed the counters left `then` large and
+        // `now` small. Wrapping subtraction turned that into a multi-hour part.
+        let then = [1_000, 50, 10_000_000, 0, 8, 3];
+        let now = [1_225, 50, 4, 0, 7, 90];
+        assert_eq!(prep_delta(now, then), [225, 0, 0, 0, 0, 87]);
+        assert!(now[2].wrapping_sub(then[2]) > 1 << 32);
+        assert!(now[4].wrapping_sub(then[4]) > 1 << 32);
+    }
+
+    #[test]
+    fn a_refresh_keeps_the_gap_between_two_asks_and_joins_what_touches() {
+        let mut ranges = Vec::new();
+        admit_range(&mut ranges, 1_000, 1_100);
+        admit_range(&mut ranges, 4_000, 4_200);
+        // The pages between the asks are not part of either refresh.
+        assert_eq!(ranges, [(1_000, 1_100), (4_000, 4_200)]);
+        let copied: usize = ranges.iter().map(|(from, to)| to - from).sum();
+        assert_eq!(copied, 300);
+        // Touching and overlapping asks become one. A later ask that
+        // bridges the gap does too.
+        admit_range(&mut ranges, 1_100, 1_150);
+        admit_range(&mut ranges, 3_900, 4_050);
+        assert_eq!(ranges, [(1_000, 1_150), (3_900, 4_200)]);
+        admit_range(&mut ranges, 1_150, 3_900);
+        assert_eq!(ranges, [(1_000, 4_200)]);
+        admit_range(&mut ranges, 50, 50);
+        assert_eq!(ranges, [(1_000, 4_200)]);
+    }
+
+    #[test]
+    fn abutting_fetch_pieces_of_one_buffer_are_one_copy() {
+        // (buffer, source start, source end, destination)
+        let pieces = [
+            (1usize, 0, 64 << 10, 0u64),
+            (1, 64 << 10, 128 << 10, (64 << 10) as u64),
+            (1, 192 << 10, 256 << 10, (128 << 10) as u64),
+            (2, 0, 4096, (192 << 10) as u64),
+            (2, 4096, 8192, ((192 << 10) + 4096) as u64),
+        ];
+        let groups = coalesce_groups(&pieces);
+        assert_eq!(groups, [0..2, 2..3, 3..5]);
+        // The joined copy covers the same source bytes at the same destination.
+        let joined: Vec<(usize, usize, usize, u64)> = groups
+            .iter()
+            .map(|group| {
+                let (key, lo, _, at) = pieces[group.start];
+                let hi = pieces[group.end - 1].2;
+                (key, lo, hi, at)
+            })
+            .collect();
+        assert_eq!(
+            joined,
+            [
+                (1, 0, 128 << 10, 0),
+                (1, 192 << 10, 256 << 10, (128 << 10) as u64),
+                (2, 0, 8192, (192 << 10) as u64),
+            ]
+        );
+        // A destination that is not packed stays split.
+        let split = [(7usize, 0, 10, 0u64), (7, 10, 20, 0u64)];
+        assert_eq!(coalesce_groups(&split), [0..1, 1..2]);
+        assert!(coalesce_groups::<(usize, usize, usize, u64)>(&[]).is_empty());
+    }
+
+    #[test]
+    fn small_pooled_textures_may_sit_on_4k_and_readback_stays_capped() {
+        const K4: u64 = 4 << 10;
+        const K64: u64 = 64 << 10;
+        assert_eq!(pooled_texture_align(K64, false), Some(K64));
+        assert_eq!(pooled_texture_align(K64, true), Some(K64));
+        assert_eq!(pooled_texture_align(K4, false), None);
+        assert_eq!(pooled_texture_align(K4, true), Some(K4));
+        assert_eq!(pooled_texture_align(0, true), None);
+        assert_eq!(pooled_texture_align(4095, true), None);
+        assert_eq!(readback_pool_bytes(true), 48 << 20);
+        assert_eq!(readback_pool_bytes(false), 256 << 20);
+    }
+
+    #[test]
+    fn a_merge_keeps_the_byte_the_card_did_not_write() {
+        let now = [1u8, 2, 3, 4, 9, 9, 9, 9, 5];
+        let mut held = [1u8, 0, 3, 0, 1, 1, 1, 1, 5];
+        let mut title = [7u8, 7, 7, 7, 8, 8, 8, 8, 6];
+        assert!(merge_changed(&now, &mut held, &mut title));
+        assert_eq!(title, [7, 2, 7, 4, 9, 9, 9, 9, 6]);
+        assert_eq!(held, [1, 2, 3, 4, 9, 9, 9, 9, 5]);
+        // The card wrote a byte the title already holds: the title is
+        // unchanged, and the copy takes the card's byte.
+        let now = [5u8, 5, 5, 5, 5, 5, 5, 5];
+        let mut held = [0u8; 8];
+        let mut title = [5u8; 8];
+        assert!(!merge_changed(&now, &mut held, &mut title));
+        assert_eq!(held, [5u8; 8]);
+        assert_eq!(title, [5u8; 8]);
+        let same = [1u8, 2, 3];
+        let mut held = same;
+        let mut title = [9u8, 9, 9];
+        assert!(!merge_changed(&same, &mut held, &mut title));
+        assert_eq!(title, [9, 9, 9]);
+        assert!(!merge_changed(&[], &mut [], &mut []));
+        // A whole equal block of 64 is left as it is; the byte after it
+        // is the card's.
+        let mut now = vec![1u8; 65];
+        now[64] = 9;
+        let mut held = vec![1u8; 65];
+        let mut title = vec![3u8; 65];
+        assert!(merge_changed(&now, &mut held, &mut title));
+        assert!(title[..64].iter().all(|&b| b == 3));
+        assert_eq!((title[64], held[64]), (9, 9));
+        assert!(held[..64].iter().all(|&b| b == 1));
+    }
+
+    #[test]
+    fn a_merge_skips_a_clean_4k_block_and_joins_dirty_ones() {
+        let mut now = vec![0u8; 12 << 10];
+        let was = vec![0u8; 12 << 10];
+        assert!(dirty_blocks(&now, &was, MERGE_BLOCK).is_empty());
+        now[100] = 1;
+        now[9000] = 2;
+        assert_eq!(
+            dirty_blocks(&now, &was, MERGE_BLOCK),
+            [(0, MERGE_BLOCK), (8192, MERGE_BLOCK)]
+        );
+        now[4096] = 1;
+        assert_eq!(dirty_blocks(&now, &was, MERGE_BLOCK), [(0, 12 << 10)]);
+        assert!(dirty_blocks(&now, &was, 0).is_empty());
+        // A high bit in one byte does not change the next byte.
+        let now = [0x80u8, 0, 0, 0, 0, 0, 0, 1];
+        let mut held = [0u8; 8];
+        let mut title = [3u8, 4, 5, 6, 7, 8, 9, 10];
+        assert!(merge_changed(&now, &mut held, &mut title));
+        assert_eq!(title, [0x80, 4, 5, 6, 7, 8, 9, 1]);
+        assert_eq!(held, [0x80, 0, 0, 0, 0, 0, 0, 1]);
     }
 
     #[test]

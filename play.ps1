@@ -16,7 +16,7 @@
 #
 # One line of stage times per presented frame (off here; set it in this
 # window before the script if the next run should say where the milliseconds
-# went):
+# went). Preparing-part counters saturate, so a part cannot wrap:
 #   $env:VICTORY_FRAME_TIMINGS = '1'
 
 $ErrorActionPreference = 'Stop'
@@ -43,15 +43,24 @@ $env:VICTORY_HEAP_WORKER = '1'
 $env:VICTORY_LOOKUP_CACHE = '1'
 $env:VICTORY_SETTLE_ROOM = '1'
 $env:VICTORY_PARALLEL_REFRESH = '1'
-# A title copy no longer flushes every pending refresh. A range already
-# brought up to date is not copied again until title memory is written.
-# Copies into host buffers are the processor's, with the kernel behind a
-# missing page.
-$env:VICTORY_NEAR_WRITES = '1'
-$env:VICTORY_REFRESH_ONCE = '1'
-$env:VICTORY_COPY_PLAIN = '1'
 $env:VICTORY_INPLACE = '0'
 $env:VICTORY_CARD_FETCH_INFLIGHT = '0'
+# A buffer view that misses its copy's elements is refused (it reads zeros).
+# On, each such view takes the shadow::exact lock. Flip this one line to 1
+# to give those views a copy of their own bytes.
+$env:VICTORY_VIEW_OWN_COPY = '0'
+# Title memory into host buffers is copied in place (same bytes; a missing
+# page falls back to the kernel). The kernel copy of the copies stage was
+# about 1.5 GB/s on the laptop.
+$env:VICTORY_COPY_PLAIN = '1'
+# Fetches of what shaders wrote use the copy engine (bit 1 only; uploads
+# stay on the direct queue). On the graphics queue that fetch waited
+# behind every later draw. After prepare got faster, copy-back was 240 ms
+# for 45 MB.
+$env:VICTORY_QUEUE2 = '1'
+# Small pooled textures the driver accepts at 4 KiB share a 4 KiB heap.
+# Reserved textures stay at 64 KiB (VICTORY_RESERVED_ALIGN is not set).
+$env:VICTORY_POOL_SMALL = '1'
 Remove-Item Env:VICTORY_SHADER_CACHE_KEY -ErrorAction SilentlyContinue
 Remove-Item Env:VICTORY_BUFFER_HEAPS -ErrorAction SilentlyContinue
 Remove-Item Env:VICTORY_WINDOW_KB -ErrorAction SilentlyContinue
