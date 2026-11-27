@@ -5118,17 +5118,14 @@ fn relay_hand_back(back: &[Declared]) {
         crate::copystat::C::BackScanUs,
         scanning.elapsed().as_micros() as u64,
     );
-    let (mut now, mut title) = (Vec::new(), Vec::new());
+    let mut flat = Vec::new();
     for ((shadow, from, to), found) in work.iter().zip(found) {
-        let mut written = 0;
         for (at, n) in found {
-            written += shadow.relay_merge(at, n, &mut now, &mut title);
+            flat.push((shadow.clone(), at, n));
         }
-        copy_back(1, written as u64);
-        #[cfg(feature = "diagnostics")]
-        crate::copystat::compared(*from, to - from, written);
         let _ = (from, to);
     }
+    copy_back(1, crate::shadow::relay_merge_many(&flat) as u64);
 }
 
 /// For the frame-rate line, with [`late`]: what the line of flights did
@@ -6818,17 +6815,7 @@ impl Host {
             CARD_STATS[6].fetch_add(us, Ordering::Relaxed);
         }
         let merging = std::time::Instant::now();
-        let mut title = Vec::new();
-        let mut written = 0;
-        for (shadow, lo, hi, at) in &pieces {
-            // SAFETY: the mapping of the fetched bytes, `total` of them;
-            // the copy into it has run.
-            let gpu =
-                unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
-            let merged = shadow.card_merge_relay(*lo, gpu, after, &mut title);
-            shadow.walls_merged(gpu.len(), merged);
-            written += merged;
-        }
+        let written = crate::shadow::card_merge_many(&pieces, data, after);
         note_copy_back(2, merging.elapsed().as_micros() as u64);
         copy_back(1, written as u64);
         // Sends up to `after` are of no use to any later merge; with the
@@ -7753,6 +7740,11 @@ impl Host {
             }
             let ranges: Vec<(usize, usize)> = spans.into_values().collect();
             crate::watch::ask_once(&ranges);
+            // The asking, without the settle. A settle waits for the
+            // landing thread (the frame line's "wait for the card" and
+            // "copy-back") and used to be counted here as well, so "ask"
+            // grew by the whole merge.
+            part = prep_part(0, part);
             // Behind flights: the title wrote memory that a flight's shaders
             // may write too, and this submission refreshes it. The flights
             // are settled, and the asking made again: the copy-back wrote
@@ -7761,14 +7753,19 @@ impl Host {
                 let settling = std::time::Instant::now();
                 self.settle(&mut submitted, WHY_STALE);
                 settled += settling.elapsed();
+                let again = std::time::Instant::now();
                 crate::watch::ask_once(&ranges);
+                part = prep_part(0, again);
             }
         } else if behind && stale_under_flights(runs) {
+            prep_part(0, part);
             let settling = std::time::Instant::now();
             self.settle(&mut submitted, WHY_STALE);
             settled += settling.elapsed();
+            part = std::time::Instant::now();
+        } else {
+            part = prep_part(0, part);
         }
-        part = prep_part(0, part);
         for list in runs {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
@@ -10832,6 +10829,32 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
         2 => return,
         _ => {}
     }
+    // A large copy into a host buffer is one range the title wrote. Four
+    // threads move it; the bytes and the pages are the same ones. Title
+    // destinations stay on this thread (the guards are opened once).
+    if !title_dst && len >= 4 << 20 {
+        let threads = (len / (4 << 20)).clamp(2, 4);
+        let each = len.div_ceil(threads);
+        let dst = dst as usize;
+        let src = src as usize;
+        std::thread::scope(|scope| {
+            for i in 0..threads {
+                let at = (i * each).min(len);
+                let n = each.min(len.saturating_sub(at));
+                if n == 0 {
+                    continue;
+                }
+                scope.spawn(move || {
+                    copy_mapped_span((dst + at) as *mut u8, (src + at) as *const u8, n, false);
+                });
+            }
+        });
+        return;
+    }
+    copy_mapped_span(dst, src, len, title_dst);
+}
+
+fn copy_mapped_span(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
     if len == 0 {
         return;
     }

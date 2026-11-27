@@ -409,6 +409,26 @@ pub(crate) fn merge_changed(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bo
     let n = now.len().min(held.len()).min(title.len());
     let mut changed = false;
     let mut i = 0;
+    // Equal 64-byte blocks are one compare (the compiler turns slice
+    // equality into a vector compare) and are not written.
+    while i + 64 <= n {
+        if now[i..i + 64] == held[i..i + 64] {
+            i += 64;
+            continue;
+        }
+        changed |= merge_words(&now[i..i + 64], &mut held[i..i + 64], &mut title[i..i + 64]);
+        i += 64;
+    }
+    if i < n {
+        changed |= merge_words(&now[i..n], &mut held[i..n], &mut title[i..n]);
+    }
+    changed
+}
+
+fn merge_words(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
+    let n = now.len().min(held.len()).min(title.len());
+    let mut changed = false;
+    let mut i = 0;
     while i + 8 <= n {
         let nw = load8(&now[i..]);
         let hw = load8(&held[i..]);
@@ -431,6 +451,33 @@ pub(crate) fn merge_changed(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bo
         i += 1;
     }
     changed
+}
+
+/// How a merge cuts a fetched piece before it reads title memory. An equal
+/// block is not read and not written.
+pub(crate) const MERGE_BLOCK: usize = 4096;
+
+/// The runs of `block` bytes where `now` differs from `was`, adjacent runs
+/// joined, as (offset, bytes). A block is one slice compare. `block` of 0
+/// compares nothing.
+pub(crate) fn dirty_blocks(now: &[u8], was: &[u8], block: usize) -> Vec<(usize, usize)> {
+    let n = now.len().min(was.len());
+    if block == 0 || n == 0 {
+        return Vec::new();
+    }
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    let mut at = 0;
+    while at < n {
+        let len = block.min(n - at);
+        if now[at..at + len] != was[at..at + len] {
+            match out.last_mut() {
+                Some(last) if last.0 + last.1 == at => last.1 += len,
+                _ => out.push((at, len)),
+            }
+        }
+        at += len;
+    }
+    out
 }
 
 fn load8(s: &[u8]) -> u64 {
@@ -897,6 +944,32 @@ mod tests {
         assert!(!merge_changed(&same, &mut held, &mut title));
         assert_eq!(title, [9, 9, 9]);
         assert!(!merge_changed(&[], &mut [], &mut []));
+        // A whole equal block of 64 is left as it is; the byte after it
+        // is the card's.
+        let mut now = vec![1u8; 65];
+        now[64] = 9;
+        let mut held = vec![1u8; 65];
+        let mut title = vec![3u8; 65];
+        assert!(merge_changed(&now, &mut held, &mut title));
+        assert!(title[..64].iter().all(|&b| b == 3));
+        assert_eq!((title[64], held[64]), (9, 9));
+        assert!(held[..64].iter().all(|&b| b == 1));
+    }
+
+    #[test]
+    fn a_merge_skips_a_clean_4k_block_and_joins_dirty_ones() {
+        let mut now = vec![0u8; 12 << 10];
+        let was = vec![0u8; 12 << 10];
+        assert!(dirty_blocks(&now, &was, MERGE_BLOCK).is_empty());
+        now[100] = 1;
+        now[9000] = 2;
+        assert_eq!(
+            dirty_blocks(&now, &was, MERGE_BLOCK),
+            [(0, MERGE_BLOCK), (8192, MERGE_BLOCK)]
+        );
+        now[4096] = 1;
+        assert_eq!(dirty_blocks(&now, &was, MERGE_BLOCK), [(0, 12 << 10)]);
+        assert!(dirty_blocks(&now, &was, 0).is_empty());
         // A high bit in one byte does not change the next byte.
         let now = [0x80u8, 0, 0, 0, 0, 0, 0, 1];
         let mut held = [0u8; 8];

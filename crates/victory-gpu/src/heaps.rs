@@ -109,11 +109,16 @@ fn pool_small() -> bool {
         let raw = std::env::var("VICTORY_POOL_SMALL").ok();
         let profile = crate::tuning::profile();
         let tight = profile.levels_on_demand && profile.staging_mb <= 64;
-        match raw.as_deref().map(str::trim) {
+        let on = match raw.as_deref().map(str::trim) {
             Some("1" | "on") => true,
             Some("0" | "off") => false,
             _ => tight,
-        }
+        };
+        tracing::info!(
+            on,
+            "pooled small textures at 4 KiB (VICTORY_POOL_SMALL); reserved textures stay at 64 KiB"
+        );
+        on
     })
 }
 
@@ -250,7 +255,13 @@ fn cut_range(host: &crate::host::Host, len: u64, align: u64) -> Option<(ID3D12He
     let (index, offset) = match found {
         Some(found) => found,
         None => {
-            let size = heap_bytes();
+            // A 4 KiB heap is 16 MiB, not the 64 MiB plain heap: small
+            // textures must not take a 64 MiB default heap of their own.
+            let size = if align == SMALL {
+                16 << 20
+            } else {
+                heap_bytes()
+            };
             if let Some([budget, used, ..]) = host.video_memory() {
                 let hundredths = crate::tuning::profile().room_percent.clamp(50, 97);
                 if used + size > budget / 100 * hundredths {
@@ -277,9 +288,23 @@ fn cut_range(host: &crate::host::Host, len: u64, align: u64) -> Option<(ID3D12He
             if let Err(e) = unsafe { host.device.CreateHeap(&raw const heap_desc, &raw mut made) } {
                 if align == SMALL {
                     SMALL_REFUSED.store(true, Ordering::Relaxed);
+                    tracing::warn!(
+                        error = %e,
+                        "4 KiB placement refused; pooled small textures stay at 64 KiB (VICTORY_POOL_SMALL)"
+                    );
+                } else {
+                    tracing::warn!(error = %e, align, "no heap for plain textures");
                 }
-                tracing::warn!(error = %e, align, "no heap for plain textures");
                 return None;
+            }
+            if align == SMALL {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    tracing::info!(
+                        size_mb = size >> 20,
+                        "4 KiB placement is in use for pooled small textures (VICTORY_POOL_SMALL); reserved textures stay at 64 KiB"
+                    );
+                });
             }
             let mut fresh = TextureHeap {
                 heap: made?,
