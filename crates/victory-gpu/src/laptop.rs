@@ -301,10 +301,16 @@ pub(crate) struct SnapshotPool {
 }
 
 impl SnapshotPool {
+    /// Bytes kept. The memory line reads this; a build without that line
+    /// does not.
+    #[cfg_attr(not(any(test, feature = "diagnostics")), allow(dead_code))]
     pub(crate) fn bytes(&self) -> usize {
         self.bytes
     }
 
+    /// Buffers kept. The memory line reads this; a build without that line
+    /// does not.
+    #[cfg_attr(not(any(test, feature = "diagnostics")), allow(dead_code))]
     pub(crate) fn len(&self) -> usize {
         self.buckets.values().map(Vec::len).sum()
     }
@@ -366,6 +372,83 @@ impl SnapshotPool {
             }
         }
     }
+}
+
+/// Alignment a pooled plain texture is placed at.
+///
+/// `info_align` is what `GetResourceAllocationInfo` reported. 64 KiB is the
+/// heap the reserved-texture path also uses. 4 KiB is only for a resource
+/// the driver accepted at 4 KiB, and only when `small_on`
+/// (`VICTORY_POOL_SMALL`). Reserved textures do not come through here:
+/// [`reserved_alignment`] stays the default 64 KiB.
+pub(crate) fn pooled_texture_align(info_align: u64, small_on: bool) -> Option<u64> {
+    const K4: u64 = 4 << 10;
+    const K64: u64 = 64 << 10;
+    if info_align == K64 {
+        Some(K64)
+    } else if small_on && info_align == K4 {
+        Some(K4)
+    } else {
+        None
+    }
+}
+
+/// Bytes of read-back buffers kept for reuse. A tight machine keeps 48 MiB
+/// so an 8 GB card's system read-back does not grow without a bound.
+/// A larger machine keeps 256 MiB.
+pub(crate) fn readback_pool_bytes(tight: bool) -> u64 {
+    if tight { 48 << 20 } else { 256 << 20 }
+}
+
+/// Where `now` differs from `held`, both `title` and `held` take that byte
+/// of `now`. Every other byte stays. Returns whether `title` changed.
+///
+/// A byte the card wrote and the title already holds does not count as a
+/// change. The three slices are read up to the shortest of them.
+pub(crate) fn merge_changed(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
+    let n = now.len().min(held.len()).min(title.len());
+    let mut changed = false;
+    let mut i = 0;
+    while i + 8 <= n {
+        let nw = load8(&now[i..]);
+        let hw = load8(&held[i..]);
+        let tw = load8(&title[i..]);
+        let mask = differing_bytes(nw ^ hw);
+        if mask != 0 {
+            let merged = (tw & !mask) | (nw & mask);
+            changed |= merged != tw;
+            store8(&mut held[i..], (hw & !mask) | (nw & mask));
+            store8(&mut title[i..], merged);
+        }
+        i += 8;
+    }
+    while i < n {
+        let wrote = if now[i] != held[i] { 0xff } else { 0 };
+        let merged = (title[i] & !wrote) | (now[i] & wrote);
+        changed |= merged != title[i];
+        held[i] = (held[i] & !wrote) | (now[i] & wrote);
+        title[i] = merged;
+        i += 1;
+    }
+    changed
+}
+
+fn load8(s: &[u8]) -> u64 {
+    u64::from_ne_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]])
+}
+
+fn store8(s: &mut [u8], v: u64) {
+    s[..8].copy_from_slice(&v.to_ne_bytes());
+}
+
+/// Every byte of `xor` that is not zero, widened to `0xff`.
+fn differing_bytes(xor: u64) -> u64 {
+    let mut m = xor;
+    m |= m >> 1;
+    m |= m >> 2;
+    m |= m >> 4;
+    m &= 0x0101_0101_0101_0101;
+    m.wrapping_mul(0xff)
 }
 
 /// Bytes in one shared texture heap (`VICTORY_TEXTURE_HEAP_MB`, default 64,
@@ -776,6 +859,51 @@ mod tests {
         let split = [(7usize, 0, 10, 0u64), (7, 10, 20, 0u64)];
         assert_eq!(coalesce_groups(&split), [0..1, 1..2]);
         assert!(coalesce_groups::<(usize, usize, usize, u64)>(&[]).is_empty());
+    }
+
+    #[test]
+    fn small_pooled_textures_may_sit_on_4k_and_readback_stays_capped() {
+        const K4: u64 = 4 << 10;
+        const K64: u64 = 64 << 10;
+        assert_eq!(pooled_texture_align(K64, false), Some(K64));
+        assert_eq!(pooled_texture_align(K64, true), Some(K64));
+        assert_eq!(pooled_texture_align(K4, false), None);
+        assert_eq!(pooled_texture_align(K4, true), Some(K4));
+        assert_eq!(pooled_texture_align(0, true), None);
+        assert_eq!(pooled_texture_align(4095, true), None);
+        assert_eq!(readback_pool_bytes(true), 48 << 20);
+        assert_eq!(readback_pool_bytes(false), 256 << 20);
+    }
+
+    #[test]
+    fn a_merge_keeps_the_byte_the_card_did_not_write() {
+        let now = [1u8, 2, 3, 4, 9, 9, 9, 9, 5];
+        let mut held = [1u8, 0, 3, 0, 1, 1, 1, 1, 5];
+        let mut title = [7u8, 7, 7, 7, 8, 8, 8, 8, 6];
+        assert!(merge_changed(&now, &mut held, &mut title));
+        assert_eq!(title, [7, 2, 7, 4, 9, 9, 9, 9, 6]);
+        assert_eq!(held, [1, 2, 3, 4, 9, 9, 9, 9, 5]);
+        // The card wrote a byte the title already holds: the title is
+        // unchanged, and the copy takes the card's byte.
+        let now = [5u8, 5, 5, 5, 5, 5, 5, 5];
+        let mut held = [0u8; 8];
+        let mut title = [5u8; 8];
+        assert!(!merge_changed(&now, &mut held, &mut title));
+        assert_eq!(held, [5u8; 8]);
+        assert_eq!(title, [5u8; 8]);
+        let same = [1u8, 2, 3];
+        let mut held = same;
+        let mut title = [9u8, 9, 9];
+        assert!(!merge_changed(&same, &mut held, &mut title));
+        assert_eq!(title, [9, 9, 9]);
+        assert!(!merge_changed(&[], &mut [], &mut []));
+        // A high bit in one byte does not change the next byte.
+        let now = [0x80u8, 0, 0, 0, 0, 0, 0, 1];
+        let mut held = [0u8; 8];
+        let mut title = [3u8, 4, 5, 6, 7, 8, 9, 10];
+        assert!(merge_changed(&now, &mut held, &mut title));
+        assert_eq!(title, [0x80, 4, 5, 6, 7, 8, 9, 1]);
+        assert_eq!(held, [0x80, 0, 0, 0, 0, 0, 0, 1]);
     }
 
     #[test]

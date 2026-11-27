@@ -24,14 +24,19 @@ const HEAPED_MOST: u64 = 8 << 20;
 /// Free bytes kept when an empty heap is given back. One empty heap stays
 /// so the next texture does not pay for creating it.
 const HEAP_KEPT: u64 = 64 << 20;
-/// 64 KiB, the only alignment these heaps cut on. 4 KiB is what reserved
-/// textures on an 8 GB NVIDIA card were refused for.
+/// 64 KiB, the alignment reserved textures and ordinary pooled textures
+/// cut on. 4 KiB is what reserved textures on an 8 GB NVIDIA card were
+/// refused for; it is not used for those.
 const PLAIN: u64 = 64 << 10;
+/// 4 KiB, only for a pooled plain texture the driver accepted at 4 KiB
+/// (`VICTORY_POOL_SMALL`). Not [`reserved_alignment`].
+const SMALL: u64 = 4 << 10;
 
 struct TextureHeap {
     heap: ID3D12Heap,
     ranges: RangePool,
     size: u64,
+    align: u64,
 }
 
 // SAFETY: a free-threaded D3D12 heap.
@@ -68,6 +73,9 @@ static HEAPS: Mutex<Vec<Option<TextureHeap>>> = Mutex::new(Vec::new());
 static LEAVING: Mutex<Vec<Leaving>> = Mutex::new(Vec::new());
 /// Bytes of the heaps that no texture is placed in.
 static FREE: AtomicU64 = AtomicU64::new(0);
+/// Set when the card refuses a 4 KiB heap. Later small textures use the
+/// 64 KiB heap, or a committed texture, and do not ask again.
+static SMALL_REFUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Whether new plain textures are placed in heaps.
 pub(crate) fn enabled() -> bool {
@@ -90,6 +98,22 @@ fn heap_bytes() -> u64 {
     static SIZE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *SIZE.get_or_init(|| {
         crate::laptop::texture_heap_bytes(std::env::var("VICTORY_TEXTURE_HEAP_MB").ok().as_deref())
+    })
+}
+
+/// Whether a pooled plain texture may sit at 4 KiB. Unset follows the
+/// small profile. `0` stays at 64 KiB. Reserved textures do not read this.
+fn pool_small() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let raw = std::env::var("VICTORY_POOL_SMALL").ok();
+        let profile = crate::tuning::profile();
+        let tight = profile.levels_on_demand && profile.staging_mb <= 64;
+        match raw.as_deref().map(str::trim) {
+            Some("1" | "on") => true,
+            Some("0" | "off") => false,
+            _ => tight,
+        }
     })
 }
 
@@ -137,8 +161,13 @@ fn give_back(index: usize, offset: u64, len: u64) {
 
 /// `desc` placed in a shared heap, in `state`, with the range that keeps
 /// that memory for it. `None` when heaps are off, the texture is too big or
-/// not 64 KiB aligned, or the card has no room for another heap: the caller
-/// makes a committed texture.
+/// not aligned for a heap, or the card has no room for another heap: the
+/// caller makes a committed texture.
+///
+/// A texture the driver accepts at 4 KiB is placed in a 4 KiB heap when
+/// [`pool_small`] is on. Anything else stays on the 64 KiB heap.
+/// [`reserved_alignment`] is what a reserved texture asks for, and this
+/// function does not change it.
 pub(crate) fn place(
     host: &crate::host::Host,
     desc: &crate::resource::ResourceDesc,
@@ -150,20 +179,45 @@ pub(crate) fn place(
     reclaim();
     // SAFETY: `desc` has the host resource-desc layout (the same cast
     // `host_texture_as` uses for committed textures).
-    let mut gpu = unsafe {
+    let gpu = unsafe {
         std::ptr::from_ref(desc)
             .cast::<D3D12_RESOURCE_DESC>()
             .read_unaligned()
     };
-    gpu.Alignment = reserved_alignment(gpu.Alignment);
+    if pool_small()
+        && !SMALL_REFUSED.load(Ordering::Relaxed)
+        && let Some(placed) = place_at(host, gpu, SMALL, 64 << 10, state)
+    {
+        return Some(placed);
+    }
+    place_at(host, gpu, PLAIN, HEAPED_MOST, state)
+}
+
+/// `gpu` placed when the driver reports `align` and a size up to `most`.
+fn place_at(
+    host: &crate::host::Host,
+    mut gpu: D3D12_RESOURCE_DESC,
+    align: u64,
+    most: u64,
+    state: D3D12_RESOURCE_STATES,
+) -> Option<(ID3D12Resource, Cut)> {
+    gpu.Alignment = if align == SMALL {
+        SMALL
+    } else {
+        reserved_alignment(gpu.Alignment)
+    };
     // SAFETY: a plain size query.
     let info = unsafe { host.device.GetResourceAllocationInfo(0, &[gpu]) };
-    if info.SizeInBytes == 0 || info.SizeInBytes > HEAPED_MOST || info.Alignment != PLAIN {
+    let small = align == SMALL;
+    if info.SizeInBytes == 0
+        || info.SizeInBytes > most
+        || crate::laptop::pooled_texture_align(info.Alignment, small) != Some(align)
+    {
         return None;
     }
-    gpu.Alignment = PLAIN;
+    gpu.Alignment = align;
     let len = info.SizeInBytes;
-    let (heap, cut) = cut_range(host, len)?;
+    let (heap, cut) = cut_range(host, len, align)?;
     let mut texture: Option<ID3D12Resource> = None;
     // SAFETY: `cut` is this texture's alone until it is dropped, and the
     // description is the one the size was asked for.
@@ -184,11 +238,14 @@ pub(crate) fn place(
     }
 }
 
-fn cut_range(host: &crate::host::Host, len: u64) -> Option<(ID3D12Heap, Cut)> {
+fn cut_range(host: &crate::host::Host, len: u64, align: u64) -> Option<(ID3D12Heap, Cut)> {
     let mut heaps = HEAPS.lock().unwrap_or_else(|e| e.into_inner());
     let found = heaps.iter_mut().enumerate().find_map(|(i, slot)| {
         let heap = slot.as_mut()?;
-        heap.ranges.take(len, PLAIN).map(|offset| (i, offset))
+        if heap.align != align {
+            return None;
+        }
+        heap.ranges.take(len, align).map(|offset| (i, offset))
     });
     let (index, offset) = match found {
         Some(found) => found,
@@ -200,27 +257,37 @@ fn cut_range(host: &crate::host::Host, len: u64) -> Option<(ID3D12Heap, Cut)> {
                     return None;
                 }
             }
+            // A 4 KiB heap is only for pooled plain textures. A reserved
+            // texture still asks [`reserved_alignment`], which is 64 KiB.
             let heap_desc = D3D12_HEAP_DESC {
                 SizeInBytes: size,
                 Properties: D3D12_HEAP_PROPERTIES {
                     Type: D3D12_HEAP_TYPE_DEFAULT,
                     ..Default::default()
                 },
-                Alignment: reserved_alignment(0),
+                Alignment: if align == SMALL {
+                    SMALL
+                } else {
+                    reserved_alignment(0)
+                },
                 Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES,
             };
             let mut made: Option<ID3D12Heap> = None;
             // SAFETY: plain creation of a heap; the out pointer is ours.
             if let Err(e) = unsafe { host.device.CreateHeap(&raw const heap_desc, &raw mut made) } {
-                tracing::warn!(error = %e, "no heap for plain textures");
+                if align == SMALL {
+                    SMALL_REFUSED.store(true, Ordering::Relaxed);
+                }
+                tracing::warn!(error = %e, align, "no heap for plain textures");
                 return None;
             }
             let mut fresh = TextureHeap {
                 heap: made?,
                 ranges: RangePool::new(size),
                 size,
+                align,
             };
-            let offset = fresh.ranges.take(len, PLAIN)?;
+            let offset = fresh.ranges.take(len, align)?;
             FREE.fetch_add(size, Ordering::Relaxed);
             let index = match heaps.iter().position(Option::is_none) {
                 Some(index) => {
@@ -232,7 +299,12 @@ fn cut_range(host: &crate::host::Host, len: u64) -> Option<(ID3D12Heap, Cut)> {
                     heaps.len() - 1
                 }
             };
-            tracing::debug!(index, size_mb = size >> 20, "a heap for plain textures");
+            tracing::debug!(
+                index,
+                size_mb = size >> 20,
+                align,
+                "a heap for plain textures"
+            );
             (index, offset)
         }
     };

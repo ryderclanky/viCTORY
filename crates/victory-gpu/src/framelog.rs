@@ -809,14 +809,16 @@ const RECENT: usize = 64;
 const LONG_MOST: usize = 8;
 
 /// One frame's stages, for [`timings`]. `prep` is the six parts of
-/// preparing, in microseconds.
-fn timing_line(f: &Frame, prep: [u64; 6], private: u64) -> String {
+/// preparing, in microseconds. `back` is copy-back's alloc, wait, and merge.
+fn timing_line(f: &Frame, prep: [u64; 6], back: [u64; 3], private: u64) -> String {
     let ms = |x: T| f.t[x as usize] / 1e3;
     let part = |i: usize| prep[i] as f64 / 1e3;
+    let back_ms = |i: usize| back[i] as f64 / 1e3;
     format!(
         "frame timings: {:.1} ms | prepare {:.1} | wait for the card {:.1} | copies {:.1} ms {:.1} MB | \
          copy-back {:.1} ms {:.2} MB | record {:.1} ms in {:.0} calls | refresh {:.1} | remap {:.1} | \
          pipeline wait {:.1} | draws {:.0} | parts ask {:.1} steps {:.1} flush {:.1} snap {:.1} card {:.1} hand {:.1} | \
+         cb-alloc {:.1} cb-wait {:.1} cb-merge {:.1} | \
          private {private} MB, free {:.0} MB",
         f.us / 1e3,
         ms(T::PrepareUs),
@@ -837,12 +839,17 @@ fn timing_line(f: &Frame, prep: [u64; 6], private: u64) -> String {
         part(3),
         part(4),
         part(5),
+        back_ms(0),
+        back_ms(1),
+        back_ms(2),
         f.s[S_FREE_MB],
     )
 }
 
 /// Preparing-part totals at the previous present, for [`timing_line`].
 static PREP_AT: Mutex<[u64; 6]> = Mutex::new([0; 6]);
+/// Copy-back part totals at the previous present.
+static COPY_BACK_AT: Mutex<[u64; 3]> = Mutex::new([0; 3]);
 
 /// A frame ends: called at the end of the title's present call, on the
 /// thread that made it.
@@ -897,13 +904,21 @@ pub fn frame() {
                 *at = now;
                 prep
             };
-            tracing::info!("{}", timing_line(&f, prep, private_mb()));
+            let back = {
+                let mut at = COPY_BACK_AT.lock().unwrap_or_else(|e| e.into_inner());
+                let now = crate::host::copy_back_parts_us();
+                let back = std::array::from_fn(|i| now[i].saturating_sub(at[i]));
+                *at = now;
+                back
+            };
+            tracing::info!("{}", timing_line(&f, prep, back, private_mb()));
         }
         if log {
             state.frames.push(f);
         }
     } else if timings {
         *PREP_AT.lock().unwrap_or_else(|e| e.into_inner()) = crate::host::prep_parts_us();
+        *COPY_BACK_AT.lock().unwrap_or_else(|e| e.into_inner()) = crate::host::copy_back_parts_us();
     }
     if !log {
         return;

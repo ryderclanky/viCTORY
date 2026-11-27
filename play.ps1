@@ -53,6 +53,14 @@ $env:VICTORY_VIEW_OWN_COPY = '0'
 # page falls back to the kernel). The kernel copy of the copies stage was
 # about 1.5 GB/s on the laptop.
 $env:VICTORY_COPY_PLAIN = '1'
+# Fetches of what shaders wrote use the copy engine (bit 1 only; uploads
+# stay on the direct queue). On the graphics queue that fetch waited
+# behind every later draw. After prepare got faster, copy-back was 240 ms
+# for 45 MB.
+$env:VICTORY_QUEUE2 = '1'
+# Small pooled textures the driver accepts at 4 KiB share a 4 KiB heap.
+# Reserved textures stay at 64 KiB (VICTORY_RESERVED_ALIGN is not set).
+$env:VICTORY_POOL_SMALL = '1'
 Remove-Item Env:VICTORY_SHADER_CACHE_KEY -ErrorAction SilentlyContinue
 Remove-Item Env:VICTORY_BUFFER_HEAPS -ErrorAction SilentlyContinue
 Remove-Item Env:VICTORY_WINDOW_KB -ErrorAction SilentlyContinue

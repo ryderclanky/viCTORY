@@ -1127,6 +1127,33 @@ fn copy_back(i: usize, n: u64) {
     );
 }
 
+/// Parts of copy-back, never taken back: allocating the destination,
+/// waiting for the card's copy, and merging the bytes into title memory.
+/// The per-frame line differences this. Microseconds.
+static COPY_BACK_PARTS: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Copy-back time by part since the start, microseconds: alloc, wait, merge.
+pub(crate) fn copy_back_parts_us() -> [u64; 3] {
+    COPY_BACK_PARTS
+        .each_ref()
+        .map(|p| p.load(Ordering::Relaxed))
+}
+
+fn note_copy_back(part: usize, us: u64) {
+    COPY_BACK_PARTS[part].fetch_add(us, Ordering::Relaxed);
+}
+
+/// A read-back buffer kept for the next ask of the same size or smaller.
+struct KeptReadback {
+    buffer: ID3D12Resource,
+    size: u64,
+}
+
+/// Read-back buffers still in use stay here so the next frame does not
+/// allocate another. Capped by [`crate::laptop::readback_pool_bytes`].
+static READBACKS: Mutex<Vec<KeptReadback>> = Mutex::new(Vec::new());
+
 /// Adds to [`CARD_CLOCK_US`] and, for the card's idle times, to the frame
 /// log's totals.
 fn card_clock_us(i: usize, us: u64) {
@@ -6653,12 +6680,14 @@ impl Host {
                 "no list, fence or event to fetch what shaders wrote to the card's memory (VICTORY_RELAY=1)"
             ));
         };
+        let allocating = std::time::Instant::now();
         if f.buffer.as_ref().is_none_or(|b| b.2 < total) {
             let size = total.next_multiple_of(16 << 20);
             f.buffer = self
                 .shared_buffer(size)
                 .map(|(buffer, data)| (buffer, data as usize, size));
         }
+        note_copy_back(0, allocating.elapsed().as_micros() as u64);
         let Some((buffer, data, _)) = f.buffer.clone() else {
             fail(format_args!(
                 "no memory to fetch what shaders wrote to the card's memory ({total} bytes, VICTORY_RELAY=1)"
@@ -6779,6 +6808,7 @@ impl Host {
             );
         }
         let us = waiting.elapsed().as_micros() as u64;
+        note_copy_back(1, us);
         RELAY_STATS[3].fetch_add(us, Ordering::Relaxed);
         {
             use crate::shadow::CARD_STATS;
@@ -6787,6 +6817,7 @@ impl Host {
             CARD_STATS[5].fetch_add(1, Ordering::Relaxed);
             CARD_STATS[6].fetch_add(us, Ordering::Relaxed);
         }
+        let merging = std::time::Instant::now();
         let mut title = Vec::new();
         let mut written = 0;
         for (shadow, lo, hi, at) in &pieces {
@@ -6798,6 +6829,7 @@ impl Host {
             shadow.walls_merged(gpu.len(), merged);
             written += merged;
         }
+        note_copy_back(2, merging.elapsed().as_micros() as u64);
         copy_back(1, written as u64);
         // Sends up to `after` are of no use to any later merge; with the
         // fetch inside flights only those up to these plans' are
@@ -6939,6 +6971,7 @@ impl Host {
         }
         // Outside the lock: no slot of these plans is written over before
         // their tickets are landed (`inflight_tickets_landed`, after this).
+        let merging = std::time::Instant::now();
         let mut title = Vec::new();
         let (mut written, mut bytes) = (0, 0u64);
         for (shadow, lo, hi, at, after) in &pieces {
@@ -6948,6 +6981,7 @@ impl Host {
             written += shadow.card_merge_relay(*lo, gpu, *after, &mut title);
             bytes += (hi - lo) as u64;
         }
+        note_copy_back(2, merging.elapsed().as_micros() as u64);
         for plan in plans {
             for r in &plan.ranges {
                 crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
@@ -7022,7 +7056,9 @@ impl Host {
                         }
                     }
                 }
+                let merging = std::time::Instant::now();
                 relay_hand_back(&back);
+                note_copy_back(2, merging.elapsed().as_micros() as u64);
                 // Only now, and flight by flight: a range another flight
                 // in the air declared too stays closed to refreshes.
                 for flight in &flights {
@@ -11016,8 +11052,21 @@ impl Host {
 
     /// A buffer in the upload heap, mapped for writing.
     /// A buffer of `size` bytes the card writes and we read (a read back),
-    /// in the state copies into it need.
+    /// in the state copies into it need. One that nothing else holds is
+    /// reused. The pool keeps at most [`crate::laptop::readback_pool_bytes`];
+    /// past that, a buffer still in use is not dropped, and this ask gets
+    /// a buffer the pool does not keep.
     pub(crate) fn read_back_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        let size = size.max(1).next_multiple_of(64 << 10);
+        if let Some(buffer) = Self::reuse_readback(size) {
+            return Some(buffer);
+        }
+        let made = self.make_readback(size)?;
+        Self::remember_readback(made.clone(), size);
+        Some(made)
+    }
+
+    fn make_readback(&self, size: u64) -> Option<ID3D12Resource> {
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_READBACK,
             ..Default::default()
@@ -11054,6 +11103,46 @@ impl Host {
                 None
             }
         }
+    }
+
+    /// A kept read-back of at least `size` that nothing else holds.
+    fn reuse_readback(size: u64) -> Option<ID3D12Resource> {
+        let pool = READBACKS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut best: Option<usize> = None;
+        for (i, kept) in pool.iter().enumerate() {
+            if kept.size >= size
+                && references(&kept.buffer) == 1
+                && best.is_none_or(|b| pool[b].size > kept.size)
+            {
+                best = Some(i);
+            }
+        }
+        best.map(|i| pool[i].buffer.clone())
+    }
+
+    /// Keeps `buffer` when the pool is under its cap. Idle buffers are
+    /// dropped, largest first, to make room. A buffer another call still
+    /// holds is left alone, and this one is not kept.
+    fn remember_readback(buffer: ID3D12Resource, size: u64) {
+        let mut pool = READBACKS.lock().unwrap_or_else(|e| e.into_inner());
+        let profile = crate::tuning::profile();
+        let tight = profile.levels_on_demand && profile.staging_mb <= 64;
+        let cap = crate::laptop::readback_pool_bytes(tight);
+        let mut held: u64 = pool.iter().map(|k| k.size).sum();
+        while held + size > cap {
+            let Some(i) = pool
+                .iter()
+                .enumerate()
+                .filter(|(_, k)| references(&k.buffer) == 1)
+                .max_by_key(|(_, k)| k.size)
+                .map(|(i, _)| i)
+            else {
+                return;
+            };
+            held = held.saturating_sub(pool[i].size);
+            pool.swap_remove(i);
+        }
+        pool.push(KeptReadback { buffer, size });
     }
 
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
