@@ -57,13 +57,16 @@ thread_local! {
 /// in every run. (The idea is fork pull request #994's, which asks a host
 /// word at run time; here it is a translation, since the builder's state
 /// does not change during a run of ours.)
-fn no_hit() -> bool {
+pub(super) fn no_hit() -> bool {
     #[cfg(test)]
     if TEST_NO_HIT.get() {
         return true;
     }
-    std::env::var_os("VICTORY_BVH_NO_HIT").is_some_and(|v| v == "1")
-        && std::env::var_os("VICTORY_BVH_BUILDER").is_none_or(|v| v != "1")
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_BVH_NO_HIT").is_some_and(|v| v == "1")
+            && std::env::var_os("VICTORY_BVH_BUILDER").is_none_or(|v| v != "1")
+    })
 }
 
 /// Where the instruction's node is.

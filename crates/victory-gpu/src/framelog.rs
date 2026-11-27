@@ -16,6 +16,10 @@
 //! On by default in diagnostics builds, off in others;
 //! `VICTORY_FRAME_LOG=1` or `0` says otherwise. The counters themselves
 //! are plain atomic adds in every build.
+//!
+//! `VICTORY_FRAME_TIMINGS=1` (off unless set) writes one short line per
+//! presented frame from those same counters, without waiting for the
+//! five-second reading.
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -396,6 +400,21 @@ pub fn on() -> bool {
     })
 }
 
+/// One short line of stage times per presented frame
+/// (`VICTORY_FRAME_TIMINGS=1`; off unless set). The five-second frame log
+/// averages those stages; this line is the frame itself, so a benchmark can
+/// see which stage still holds the milliseconds.
+pub fn timings() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_FRAME_TIMINGS").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("one line of stage times per presented frame (VICTORY_FRAME_TIMINGS=1)");
+        }
+        on
+    })
+}
+
 fn micros(t: windows_sys::Win32::Foundation::FILETIME) -> u64 {
     (u64::from(t.dwHighDateTime) << 32 | u64::from(t.dwLowDateTime)) / 10
 }
@@ -456,6 +475,20 @@ fn page_faults() -> u64 {
     // SAFETY: our own process and a sized structure.
     unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
     u64::from(c.PageFaultCount)
+}
+
+/// This process's private commit (page file usage), in MiB.
+fn private_mb() -> u64 {
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    // SAFETY: plain data the call fills in.
+    let mut c: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+    c.cb = size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+    // SAFETY: our own process and a sized structure.
+    unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
+    (c.PagefileUsage as u64) >> 20
 }
 
 /// The PC's free physical memory, in MiB.
@@ -775,16 +808,56 @@ fn lines(frames: &[Frame], usual: f64, seconds: f64) -> Vec<String> {
 const RECENT: usize = 64;
 const LONG_MOST: usize = 8;
 
+/// One frame's stages, for [`timings`]. `prep` is the six parts of
+/// preparing, in microseconds.
+fn timing_line(f: &Frame, prep: [u64; 6], private: u64) -> String {
+    let ms = |x: T| f.t[x as usize] / 1e3;
+    let part = |i: usize| prep[i] as f64 / 1e3;
+    format!(
+        "frame timings: {:.1} ms | prepare {:.1} | wait for the card {:.1} | copies {:.1} ms {:.1} MB | \
+         copy-back {:.1} ms {:.2} MB | record {:.1} ms in {:.0} calls | refresh {:.1} | remap {:.1} | \
+         pipeline wait {:.1} | draws {:.0} | parts ask {:.1} steps {:.1} flush {:.1} snap {:.1} card {:.1} hand {:.1} | \
+         private {private} MB, free {:.0} MB",
+        f.us / 1e3,
+        ms(T::PrepareUs),
+        ms(T::CardWaitUs),
+        ms(T::CopyUs),
+        f.t[T::CopyBytes as usize] / 1e6,
+        ms(T::CopyBackUs),
+        f.t[T::CopyBackBytes as usize] / 1e6,
+        f.t[T::RecordNs as usize] / 1e6,
+        f.t[T::RecordCalls as usize],
+        ms(T::RefreshUs),
+        ms(T::RemapUs),
+        ms(T::PipelineWaitUs),
+        f.s[S_DRAWS],
+        part(0),
+        part(1),
+        part(2),
+        part(3),
+        part(4),
+        part(5),
+        f.s[S_FREE_MB],
+    )
+}
+
+/// Preparing-part totals at the previous present, for [`timing_line`].
+static PREP_AT: Mutex<[u64; 6]> = Mutex::new([0; 6]);
+
 /// A frame ends: called at the end of the title's present call, on the
 /// thread that made it.
 pub fn frame() {
-    if !on() {
+    let log = on();
+    let timings = timings();
+    if !log && !timings {
         return;
     }
     crate::cardmeter::collect();
-    add(T::RenderLooks, 1);
-    if on_slow_core() {
-        add(T::RenderSlow, 1);
+    if log {
+        add(T::RenderLooks, 1);
+        if on_slow_core() {
+            add(T::RenderSlow, 1);
+        }
     }
     let now = std::time::Instant::now();
     let totals: [u64; N] = std::array::from_fn(|i| TOTAL[i].load(Relaxed));
@@ -816,7 +889,26 @@ pub fn frame() {
             // Another thread presented: its processor time is not this frame's.
             (f.s[S_THREAD_USER], f.s[S_THREAD_KERNEL]) = (0.0, 0.0);
         }
-        state.frames.push(f);
+        if timings {
+            let prep = {
+                let mut at = PREP_AT.lock().unwrap_or_else(|e| e.into_inner());
+                let now = crate::host::prep_parts_us();
+                // Monotonic totals. A counter that went backwards was reset;
+                // report nothing huge for that part rather than the underflow.
+                let prep = std::array::from_fn(|i| now[i].saturating_sub(at[i]));
+                *at = now;
+                prep
+            };
+            tracing::info!("{}", timing_line(&f, prep, private_mb()));
+        }
+        if log {
+            state.frames.push(f);
+        }
+    } else if timings {
+        *PREP_AT.lock().unwrap_or_else(|e| e.into_inner()) = crate::host::prep_parts_us();
+    }
+    if !log {
+        return;
     }
     let elapsed = state.since.elapsed();
     if elapsed < std::time::Duration::from_secs(5) || state.frames.is_empty() {

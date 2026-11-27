@@ -165,6 +165,52 @@ pub(crate) fn ui_plane_mode(raw: Option<&str>) -> u8 {
     }
 }
 
+/// Whether host copies of title memory share heaps (`VICTORY_BUFFER_HEAPS`).
+/// `1` / `on` places them, anything else keeps one committed buffer each.
+/// A tight machine does not turn this on: the shared heaps commit their
+/// whole 64 MiB, and on the 16 GB laptop that raised private RAM.
+pub(crate) fn buffer_heaps_on(raw: Option<&str>) -> bool {
+    matches!(raw.map(str::trim), Some("1" | "on"))
+}
+
+/// A shared buffer of `size` bytes is cut from a heap when this is `Some`.
+/// Under 64 KiB stays committed: a placed buffer is aligned to 64 KiB, so a
+/// 256-byte one would reserve a whole page of the heap. Over 16 MiB stays
+/// committed so one copy cannot pin a heap.
+pub(crate) fn buffer_heap_len(size: u64) -> Option<u64> {
+    const PLAIN: u64 = 64 << 10;
+    const MOST: u64 = 16 << 20;
+    ((PLAIN..=MOST).contains(&size) && size.is_multiple_of(PLAIN)).then_some(size)
+}
+
+/// The grid, in bytes, windows of asks that give a length are cut on.
+/// Unset is 4 MiB. `VICTORY_WINDOW_KB` is a power of two from 64 KiB to
+/// 4 MiB; anything else is the 4 MiB grid.
+///
+/// A finer grid was tried on the 16 GB laptop (1 MiB, with tails). Private
+/// RAM rose from 17.3 GB to 18.5 GB and prison-cell frames went from 255 ms
+/// to 571 ms, with 5–8 s stalls that removed the device. More windows were
+/// made, copied, and let go. The stable layout is one 4 MiB window a cell.
+pub(crate) fn window_grid_bytes(raw: Option<&str>) -> u64 {
+    const WINDOW: u64 = 4 << 20;
+    let Some(raw) = raw.map(str::trim) else {
+        return WINDOW;
+    };
+    match raw.parse::<u64>().ok() {
+        Some(kb) if kb.is_power_of_two() && (64..=4096).contains(&kb) => kb << 10,
+        _ => WINDOW,
+    }
+}
+
+/// Whether an ask with no length keeps only the tail of its 4 MiB cell
+/// (`VICTORY_WINDOW_TAILS=1`). Off unless set. On a 4 MiB grid a sized ask
+/// in the same cell still makes the whole cell, so a tail is a second
+/// window of the same bytes. The laptop run that turned tails on with a
+/// 1 MiB grid committed more and stalled.
+pub(crate) fn window_tails_on(raw: Option<&str>) -> bool {
+    matches!(raw.map(str::trim), Some("1" | "on"))
+}
+
 /// Bytes in one shared texture heap (`VICTORY_TEXTURE_HEAP_MB`, default 64,
 /// clamped to 32..=256). 256 MiB is what a 16 GB card used; an 8 GB card
 /// keeps a smaller heap so an empty tail is not a large part of its budget.
@@ -440,6 +486,35 @@ mod tests {
         assert_eq!(texture_heap_bytes(Some("256")), 256 << 20);
         assert_eq!(texture_heap_bytes(Some("8")), 32 << 20);
         assert_eq!(texture_heap_bytes(Some("9999")), 256 << 20);
+    }
+
+    #[test]
+    fn windows_stay_4_mib_unless_a_grid_is_named() {
+        assert!(!buffer_heaps_on(None));
+        assert!(!buffer_heaps_on(Some("0")));
+        assert!(!buffer_heaps_on(Some("off")));
+        assert!(buffer_heaps_on(Some("1")));
+        assert!(buffer_heaps_on(Some("on")));
+
+        assert_eq!(buffer_heap_len(256), None);
+        assert_eq!(buffer_heap_len((64 << 10) - 1), None);
+        assert_eq!(buffer_heap_len(64 << 10), Some(64 << 10));
+        assert_eq!(buffer_heap_len(1 << 20), Some(1 << 20));
+        assert_eq!(buffer_heap_len(16 << 20), Some(16 << 20));
+        assert_eq!(buffer_heap_len((16 << 20) + (64 << 10)), None);
+        assert_eq!(buffer_heap_len((1 << 20) + 256), None);
+
+        assert_eq!(window_grid_bytes(None), 4 << 20);
+        assert_eq!(window_grid_bytes(Some("4096")), 4 << 20);
+        assert_eq!(window_grid_bytes(Some("1024")), 1 << 20);
+        assert_eq!(window_grid_bytes(Some("256")), 256 << 10);
+        assert_eq!(window_grid_bytes(Some("nope")), 4 << 20);
+
+        assert!(!window_tails_on(None));
+        assert!(!window_tails_on(Some("0")));
+        assert!(!window_tails_on(Some("off")));
+        assert!(window_tails_on(Some("1")));
+        assert!(window_tails_on(Some("on")));
     }
 
     #[test]

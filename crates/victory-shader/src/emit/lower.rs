@@ -1152,7 +1152,7 @@ pub(super) fn with_local_waves<R>(f: impl FnOnce() -> R) -> R {
 /// the last place of a result that is not exact is then one lower than the console's).
 /// Off by default: it is exact but untried in a game run, and adds instructions to every
 /// such operation. The wave sum of 16-bit floats ([`Lower::half_sum`]) is always exact.
-fn f16_nearest_on() -> bool {
+pub(super) fn f16_nearest_on() -> bool {
     #[cfg(test)]
     if let Some(on) = TEST_F16_NEAREST.get() {
         return on;
@@ -1169,9 +1169,41 @@ thread_local! {
 
 /// `VICTORY_WAVE_OWN_BITS=0`: a wave OR where not every lane runs is refused as before
 /// ([`super::own_bits`]).
-fn own_bits_on() -> bool {
+pub(super) fn own_bits_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_OWN_BITS").is_none_or(|v| v != "0"))
+}
+
+/// `VICTORY_FIRST_HALF=0` refuses a first half of an interpolation whose result
+/// is read as data. Anything else (including unset) keeps the pair form.
+pub(super) fn first_half_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FIRST_HALF").is_none_or(|v| v != "0"))
+}
+
+/// `VICTORY_MESH_OUTPUT_STRICT` set: a mesh shader whose outputs still pass
+/// the host's limit after the lane cap is refused.
+pub(super) fn mesh_output_strict() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MESH_OUTPUT_STRICT").is_some())
+}
+
+/// `VICTORY_FIRSTLANE_OWN=1`: a first-lane read where not every lane runs
+/// takes the host wave's own first lane.
+pub(super) fn firstlane_own() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FIRSTLANE_OWN").is_some_and(|v| v == "1"))
+}
+
+pub(super) fn bvh_no_hit() -> bool {
+    intersect::no_hit()
+}
+
+/// `VICTORY_STRICT_JOINS` set: a join that only another join reads is marked
+/// read wherever that one is.
+pub(super) fn strict_joins_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_STRICT_JOINS").is_some())
 }
 
 /// The refusal of a first half of an interpolation whose result is read
@@ -1691,9 +1723,7 @@ impl<'a> Lower<'a> {
                 // first half only the second half reads is gone before lowering.
                 // Only in the second translation of a program the first
                 // one refused for it ([`with_first_half_pairs`]).
-                if FIRST_HALF_PAIRS.get()
-                    && std::env::var_os("VICTORY_FIRST_HALF").is_none_or(|v| v != "0")
-                {
+                if FIRST_HALF_PAIRS.get() && first_half_on() {
                     for (_, i) in &x.io.interps {
                         if let Interp::Interpolated { first, .. } = i {
                             for s in first {
@@ -4639,7 +4669,7 @@ impl<'a> Lower<'a> {
             // still emitted with the lower maxima (drivers take them);
             // refuse them here if one hangs.
             // Experiment (`VICTORY_MESH_OUTPUT_STRICT=1`): they are refused.
-            if !fits(mesh) && std::env::var_os("VICTORY_MESH_OUTPUT_STRICT").is_some() {
+            if !fits(mesh) && mesh_output_strict() {
                 return Err("a mesh shader whose outputs pass the host's 32 KiB");
             }
             self.s.mesh = Some(mesh);
@@ -8161,10 +8191,7 @@ impl<'a> Lower<'a> {
                         // first lane, exact when the value is the same in every lane of
                         // the console wave (the ray-tracing builder's scans read a sum of
                         // scalars this way, inside a loop whose exit is per console wave).
-                        static OWN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-                        if *OWN.get_or_init(|| {
-                            std::env::var_os("VICTORY_FIRSTLANE_OWN").is_some_and(|v| v == "1")
-                        }) {
+                        if firstlane_own() {
                             return int(self, mine);
                         }
                         need(self.cur_ir);
@@ -11859,8 +11886,7 @@ impl<'a> Lower<'a> {
         // stop by name with it (vehicle paint pixel shaders at "the first
         // half of an interpolation", foliage mesh shaders); until those are
         // lowered they keep drawing with that zero.
-        static STRICT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let strict = *STRICT.get_or_init(|| std::env::var_os("VICTORY_STRICT_JOINS").is_some());
+        let strict = strict_joins_on();
         let mut work: Vec<Value> = if strict {
             self.read_phis.iter().copied().collect()
         } else {

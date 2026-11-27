@@ -1,9 +1,19 @@
 //! Translated shaders kept on disk (decision 0003): under the configured
 //! cache folder, keyed by the container's content and by the translator
-//! that translated it (its source fingerprint and settings, see `build`), so
-//! a changed translator never serves an old translation. Entries go through
-//! `victory-pipeline`'s content-addressed cache, which writes them
-//! atomically; an entry that does not read back is translated again.
+//! that translated it (its source fingerprint and the settings that change
+//! the DXIL, see `build`), so a changed translator never serves an old
+//! translation. Entries go through `victory-pipeline`'s content-addressed
+//! cache, which writes them atomically; an entry that does not read back is
+//! translated again.
+//!
+//! The key does not include the whole environment. A diagnostics path
+//! (`VICTORY_SHADER_CENSUS`, `VICTORY_DXIL`), a debug flag, or a laptop
+//! memory switch (`VICTORY_PROFILE`, `VICTORY_TEXTURE_DROP_MIPS`,
+//! `VICTORY_AMBIENT`) does not change the DXIL, and putting the raw value
+//! in the key made every boot miss when that value changed. Host facts that
+//! do change the DXIL (wave size, view-heap null slot) are saved beside the
+//! entries so the next boot, and `victory translate --warm`, file them
+//! under the same key the game will look up.
 //!
 //! The entry is our own encoding of [`HostShader`]: a field added to it
 //! must be added to `encode` and `decode` too (entries of older builds
@@ -22,10 +32,13 @@ static CACHE: OnceLock<Cache> = OnceLock::new();
 static HITS: AtomicU64 = AtomicU64::new(0);
 static MISSES: AtomicU64 = AtomicU64::new(0);
 
-/// Keeps translated shaders in `dir` from now on.
+/// Keeps translated shaders in `dir` from now on. A facts file left by an
+/// earlier run is applied first, so this process looks up shaders under the
+/// same wave size and view-heap limit that wrote them.
 pub fn use_shader_cache(dir: PathBuf) {
     match Cache::open(dir) {
         Ok(cache) => {
+            apply_saved_facts(cache.root());
             let _ = CACHE.set(cache);
         }
         Err(e) => tracing::warn!(error = %e, "no shader cache"),
@@ -38,15 +51,13 @@ pub(crate) fn counts() -> (u64, u64) {
 }
 
 /// What identifies the translation, besides the container: the shader
-/// crate's fingerprint (its source, every switch it reads, the host facts the
-/// device gave it, the loop limit, barrier waits and clean-up passes) and
-/// this file's encoding of the result. Not the whole executable any more: a
-/// rebuild that leaves the translator alone keeps its translations (each new
-/// build used to translate the title's thousands of shaders again, which kept
-/// the first minutes of every test run short of pipelines).
-/// `VICTORY_SHADER_CACHE_KEY=exe` restores the old key (the executable's hash).
-/// Worked out per lookup, so a translation made before the device said its
-/// wave size is never filed under the later key.
+/// crate's fingerprint (its source, the switches that change the DXIL, the
+/// host facts the device gave it) and this file's encoding of the result.
+/// Not the whole executable: a rebuild that leaves the translator alone keeps
+/// its translations (each new build used to translate the title's thousands
+/// of shaders again). `VICTORY_SHADER_CACHE_KEY=exe` restores the old key
+/// (the executable's hash). Worked out per lookup, so a translation made
+/// before the device said its wave size is never filed under the later key.
 fn build() -> [u8; 32] {
     static WARNED: std::sync::Once = std::sync::Once::new();
     let limit = victory_shader::emit::loop_limit();
@@ -57,6 +68,9 @@ fn build() -> [u8; 32] {
                 "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
             )
         });
+    }
+    if let Some(cache) = CACHE.get() {
+        remember_facts(cache.root());
     }
     static EXE: OnceLock<Option<[u8; 32]>> = OnceLock::new();
     let exe = EXE.get_or_init(|| {
@@ -73,19 +87,91 @@ fn build() -> [u8; 32] {
         }
     });
     let mut h = blake3::Hasher::new();
-    h.update(b"victory shader cache key 2\0");
+    h.update(b"victory shader cache key 3\0");
     if let Some(exe) = exe {
         h.update(exe);
     }
     h.update(&victory_shader::emit::translation_fingerprint());
     // The list this file reads for the translator (`translate_listed`): the
-    // shader crate's fingerprint does not see it.
+    // shader crate's fingerprint does not see it. UTF-8, not the platform's
+    // opaque `OsStr` bytes: those are not a stable encoding to store.
     h.update(b"VICTORY_WAVE_WIDE_ONLY=");
     if let Some(value) = std::env::var_os("VICTORY_WAVE_WIDE_ONLY") {
-        h.update(value.as_encoded_bytes());
+        h.update(value.to_string_lossy().as_bytes());
     }
-    h.update(include_bytes!("shader_cache.rs"));
+    h.update(b"encoding-v3");
     *h.finalize().as_bytes()
+}
+
+const FACTS_FILE: &str = "host-facts-v1";
+const FACTS_MAGIC: &[u8; 4] = b"VHF1";
+
+/// Wave lanes and the view-heap null slot a previous run translated with.
+fn read_facts(dir: &std::path::Path) -> Option<(u32, u32)> {
+    let bytes = std::fs::read(dir.join(FACTS_FILE)).ok()?;
+    if bytes.len() != 12 || &bytes[..4] != FACTS_MAGIC {
+        return None;
+    }
+    let wave = u32::from_le_bytes(bytes[4..8].try_into().ok()?);
+    let view = u32::from_le_bytes(bytes[8..12].try_into().ok()?);
+    Some((wave, view))
+}
+
+fn write_facts(dir: &std::path::Path, wave: u32, view: u32) -> std::io::Result<()> {
+    let mut bytes = Vec::with_capacity(12);
+    bytes.extend_from_slice(FACTS_MAGIC);
+    bytes.extend_from_slice(&wave.to_le_bytes());
+    bytes.extend_from_slice(&view.to_le_bytes());
+    let path = dir.join(FACTS_FILE);
+    let tmp = dir.join(".host-facts.tmp");
+    std::fs::write(&tmp, &bytes)?;
+    std::fs::rename(&tmp, &path)
+}
+
+/// Fills in host facts the device has not set yet, from the last run.
+fn apply_saved_facts(dir: &std::path::Path) {
+    let Some((wave, view)) = read_facts(dir) else {
+        return;
+    };
+    if victory_shader::emit::host_wave_lanes() == 0 && wave != 0 {
+        victory_shader::emit::set_host_max_wave(wave);
+    }
+    if victory_shader::emit::view_heap_limit() == 0 && view != 0 {
+        victory_shader::emit::set_view_heap_limit(view);
+    }
+}
+
+/// Records the facts this run is translating with, once they are known, so
+/// the next boot and an offline warm-up use the same key.
+fn remember_facts(dir: &std::path::Path) {
+    static SAVED: AtomicU64 = AtomicU64::new(u64::MAX);
+    let wave = victory_shader::emit::host_wave_lanes();
+    let view = victory_shader::emit::view_heap_limit();
+    if wave == 0 && view == 0 {
+        return;
+    }
+    let packed = (u64::from(wave) << 32) | u64::from(view);
+    if SAVED.swap(packed, Ordering::Relaxed) == packed {
+        return;
+    }
+    if let Err(e) = write_facts(dir, wave, view) {
+        tracing::warn!(error = %e, "shader cache host facts not saved");
+    }
+}
+
+/// The container bytes the translator reads. A DXBC blob's own size is at
+/// byte 0x18; bytes past it are not part of the container (alignment slack,
+/// or whatever shared the allocation). Keying on that slack made every boot
+/// miss when the tail was not the same bytes.
+fn shader_bytes(container: &[u8]) -> &[u8] {
+    if container.len() >= 0x1C && container.starts_with(b"DXBC") {
+        let total =
+            u32::from_le_bytes(container[0x18..0x1C].try_into().expect("four size bytes")) as usize;
+        if (0x20..=container.len()).contains(&total) {
+            return &container[..total];
+        }
+    }
+    container
 }
 
 /// A container translated with the wave-wide form allowed when its hash is
@@ -166,6 +252,7 @@ fn cached(
     container: &[u8],
     translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
 ) -> Result<HostShader, String> {
+    let container = shader_bytes(container);
     let input = [&build[..], container].concat();
     let converter = Translate {
         translate,
@@ -453,6 +540,95 @@ mod tests {
             }
         }
         files
+    }
+
+    #[test]
+    fn a_reopened_cache_hits_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let build = [9u8; 32];
+        let container = b"console container".as_slice();
+        let runs = AtomicU64::new(0);
+        let translate = |_: &[u8]| {
+            runs.fetch_add(1, Ordering::Relaxed);
+            Ok(shader())
+        };
+        {
+            let cache = Cache::open(dir.path()).unwrap();
+            assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
+        }
+        {
+            let cache = Cache::open(dir.path()).unwrap();
+            assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
+        }
+        assert_eq!(
+            runs.load(Ordering::Relaxed),
+            1,
+            "the second process's open hit"
+        );
+    }
+
+    /// Laptop switches do not change the translation, so they must not change
+    /// the key. The facts struct has no field for them; two lookups with the
+    /// same translator facts hit, which is what a second boot does when
+    /// `VICTORY_PROFILE=small` and the texture and ambient switches are set.
+    #[test]
+    fn laptop_switches_do_not_spoil_a_hit() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let facts = victory_shader::emit::TranslationFacts::current();
+        let build = *blake3::hash(&victory_shader::emit::fingerprint_of(&facts)).as_bytes();
+        let runs = AtomicU64::new(0);
+        let translate = |_: &[u8]| {
+            runs.fetch_add(1, Ordering::Relaxed);
+            Ok(shader())
+        };
+        let container = b"laptop boot container".as_slice();
+        assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
+        assert_eq!(
+            victory_shader::emit::fingerprint_of(&facts),
+            victory_shader::emit::fingerprint_of(&victory_shader::emit::TranslationFacts::current())
+        );
+        assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
+        assert_eq!(runs.load(Ordering::Relaxed), 1);
+        assert!(
+            !format!("{facts:?}").contains("PROFILE"),
+            "the key's facts must not name a memory-profile switch"
+        );
+    }
+
+    #[test]
+    fn bytes_past_the_dxbc_container_are_not_a_different_shader() {
+        let mut container = vec![0u8; 0x20];
+        container[0..4].copy_from_slice(b"DXBC");
+        container[0x18..0x1C].copy_from_slice(&0x20u32.to_le_bytes());
+        let mut slack = container.clone();
+        slack.extend_from_slice(&[0xA5; 64]);
+        assert_eq!(shader_bytes(&container), shader_bytes(&slack));
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let build = [3u8; 32];
+        let runs = AtomicU64::new(0);
+        let translate = |_: &[u8]| {
+            runs.fetch_add(1, Ordering::Relaxed);
+            Ok(shader())
+        };
+        assert_eq!(cached(&cache, &build, &container, translate), Ok(shader()));
+        assert_eq!(cached(&cache, &build, &slack, translate), Ok(shader()));
+        assert_eq!(
+            runs.load(Ordering::Relaxed),
+            1,
+            "the tail is not part of the key"
+        );
+    }
+
+    #[test]
+    fn host_facts_survive_for_the_next_run() {
+        let dir = tempfile::tempdir().unwrap();
+        write_facts(dir.path(), 32, 999_999).unwrap();
+        assert_eq!(read_facts(dir.path()), Some((32, 999_999)));
+        std::fs::write(dir.path().join(FACTS_FILE), b"VHF0").unwrap();
+        assert_eq!(read_facts(dir.path()), None);
     }
 
     #[test]

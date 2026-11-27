@@ -2213,6 +2213,7 @@ fn shortage(video: Option<[u64; 4]>) -> Option<u64> {
 #[cfg(windows)]
 pub(crate) fn let_go_idle() {
     crate::heaps::reclaim();
+    crate::buffer_heaps::reclaim();
     use std::sync::atomic::Ordering::Relaxed;
     const IDLE_FRAMES: u64 = 4;
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();

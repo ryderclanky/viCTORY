@@ -144,15 +144,25 @@ const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 #[cfg(windows)]
 fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
     let Some(list) = host_list(this) else { return };
-    #[cfg(feature = "diagnostics")]
-    let started = std::time::Instant::now();
+    // List-call time is part of the per-frame line (`VICTORY_FRAME_TIMINGS`).
+    // Diagnostics builds time every call either way, for the frame log.
+    let started =
+        (crate::framelog::timings() || cfg!(feature = "diagnostics")).then(std::time::Instant::now);
     // SAFETY: the title passes one of our lists.
     let state = unsafe { &(*this.cast::<List>()).state };
     f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
-    #[cfg(feature = "diagnostics")]
-    crate::copystat::recorded(started);
-    #[cfg(feature = "diagnostics")]
-    crate::profile::seen(crate::profile::Seen::Record);
+    if let Some(started) = started {
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::recorded(started);
+        #[cfg(not(feature = "diagnostics"))]
+        {
+            let ns = started.elapsed().as_nanos() as u64;
+            crate::framelog::add(crate::framelog::T::RecordCalls, 1);
+            crate::framelog::add(crate::framelog::T::RecordNs, ns);
+        }
+        #[cfg(feature = "diagnostics")]
+        crate::profile::seen(crate::profile::Seen::Record);
+    }
 }
 
 /// The submission of `lists` has run: each gives its descriptor tables'
