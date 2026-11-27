@@ -186,6 +186,12 @@ pub enum T {
     /// committing and unmapping them.
     DiskViews,
     DiskViewUs,
+    /// Title-to-title copies, then refreshes of host copies. Together they
+    /// are [`T::CopyUs`] and [`T::CopyBytes`].
+    TitleCopyUs,
+    TitleCopyBytes,
+    RefreshCopyUs,
+    RefreshCopyBytes,
     Count,
 }
 
@@ -816,6 +822,7 @@ fn timing_line(f: &Frame, prep: [u64; 6], back: [u64; 3], private: u64) -> Strin
     let back_ms = |i: usize| back[i] as f64 / 1e3;
     format!(
         "frame timings: {:.1} ms | prepare {:.1} | wait for the card {:.1} | copies {:.1} ms {:.1} MB | \
+         title-copy {:.1} ms {:.1} MB | refresh-copy {:.1} ms {:.1} MB | \
          copy-back {:.1} ms {:.2} MB | record {:.1} ms in {:.0} calls | refresh {:.1} | remap {:.1} | \
          pipeline wait {:.1} | draws {:.0} | parts ask {:.1} steps {:.1} flush {:.1} snap {:.1} card {:.1} hand {:.1} | \
          cb-alloc {:.1} cb-wait {:.1} cb-merge {:.1} | \
@@ -825,6 +832,10 @@ fn timing_line(f: &Frame, prep: [u64; 6], back: [u64; 3], private: u64) -> Strin
         ms(T::CardWaitUs),
         ms(T::CopyUs),
         f.t[T::CopyBytes as usize] / 1e6,
+        ms(T::TitleCopyUs),
+        f.t[T::TitleCopyBytes as usize] / 1e6,
+        ms(T::RefreshCopyUs),
+        f.t[T::RefreshCopyBytes as usize] / 1e6,
         ms(T::CopyBackUs),
         f.t[T::CopyBackBytes as usize] / 1e6,
         f.t[T::RecordNs as usize] / 1e6,

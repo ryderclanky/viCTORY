@@ -1107,10 +1107,25 @@ fn submission_us(i: usize, us: u64) {
 }
 
 /// Adds to [`PREPARING`]'s copies (time, bytes) and to the frame log's totals.
-fn preparing(i: usize, n: u64) {
+/// `title` is a title-to-title copy. A refresh of a host copy passes false.
+fn preparing(i: usize, n: u64, title: bool) {
     PREPARING[i].fetch_add(n, Ordering::Relaxed);
     crate::framelog::add(
         [crate::framelog::T::CopyUs, crate::framelog::T::CopyBytes][i],
+        n,
+    );
+    crate::framelog::add(
+        if title {
+            [
+                crate::framelog::T::TitleCopyUs,
+                crate::framelog::T::TitleCopyBytes,
+            ]
+        } else {
+            [
+                crate::framelog::T::RefreshCopyUs,
+                crate::framelog::T::RefreshCopyBytes,
+            ]
+        }[i],
         n,
     );
 }
@@ -4641,27 +4656,16 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
     }
     if late_exact() {
         // The title's bytes are put in beside the flights' writes; a
-        // settle is still due where that could not be done. At most this
-        // many changed runs go up to copies in the card's memory, each a
-        // copy of its own there.
-        // (`VICTORY_MERGE_RUNS`: the cap. Run 218 had 500 to 5,400 changed
-        // runs a frame of a few bytes each, and the cap of 512 settled the
-        // flights twice a frame, 50 ms of the submitting thread.)
-        static RUNS: OnceLock<usize> = OnceLock::new();
-        let mut runs_left = *RUNS.get_or_init(|| {
-            std::env::var("VICTORY_MERGE_RUNS")
-                .ok()
-                .and_then(|v| v.trim().parse::<usize>().ok())
-                .map_or(512, |n| n.clamp(1, 1 << 16))
-        });
-        if settle_room() {
-            runs_left = (runs_left * 8).min(1 << 16);
-        }
+        // settle is still due where that could not be done. The budget is
+        // bytes, not a count of runs: a few hundred bytes in tens of
+        // thousands of runs used to hit a cap of 512 and settle the flights.
+        let mut bytes_left =
+            crate::laptop::merge_byte_budget(std::env::var("VICTORY_MERGE_BYTES").ok().as_deref());
         if let Some(wider) = merge_runs_alt() {
-            runs_left = wider;
+            bytes_left = bytes_left.max(wider);
         }
         return spans.iter().any(|(shadow, from, to)| {
-            shadow.merge_under_writes(*from, *to - *from, &mut runs_left)
+            shadow.merge_under_writes(*from, *to - *from, &mut bytes_left)
         });
     }
     spans
@@ -5231,8 +5235,8 @@ fn late_line(frames: f64) {
         tracing::info!(
             "title bytes put in under flights' shader writes per frame (VICTORY_LATE_WAIT=2): {pages:.0} pages looked at, \
              {runs:.0} changed runs, {:.2} MB; in these frames the merge gave up (the flights are then settled whole): {} times \
-             because the copy's memory is not watched, {} because the write tracking had no answer, {} for more changed runs than \
-             VICTORY_MERGE_RUNS leaves, {} for a copy in PC memory without its snapshot",
+             because the copy's memory is not watched, {} because the write tracking had no answer, {} for more changed bytes than \
+             the merge budget leaves, {} for a copy in PC memory without its snapshot",
             bytes / (1 << 20) as f64,
             gave_up[0],
             gave_up[1],
@@ -10049,8 +10053,8 @@ impl HostList {
                     continue;
                 }
             };
-            preparing(0, started.elapsed().as_micros() as u64);
-            preparing(1, copied as u64);
+            preparing(0, started.elapsed().as_micros() as u64, true);
+            preparing(1, copied as u64, true);
         }
     }
 }
@@ -10302,8 +10306,8 @@ impl Batch {
         let us = started.elapsed().as_micros() as u64;
         #[cfg(feature = "diagnostics")]
         crate::copystat::range(from, to - from, us, 0);
-        preparing(0, us);
-        preparing(1, copied as u64);
+        preparing(0, us, false);
+        preparing(1, copied as u64, false);
     }
 
     /// Whether `staging` is still to be refreshed in this submission (and
@@ -10509,7 +10513,7 @@ impl Batch {
                 .flat_map(|r| r.1.iter().copied())
                 .collect();
             crate::watch::ask_ahead(&ranges);
-            preparing(0, started.elapsed().as_micros() as u64);
+            preparing(0, started.elapsed().as_micros() as u64, false);
         }
         if wide_refresh() && self.refreshes.len() >= 4 {
             // Each copy on its own, several at a time: a copy's refresh
@@ -10540,6 +10544,7 @@ impl Batch {
             let over = summed.saturating_sub(started.elapsed().as_micros() as u64);
             PREPARING[0].fetch_sub(over, Ordering::Relaxed);
             crate::framelog::sub(crate::framelog::T::CopyUs, over);
+            crate::framelog::sub(crate::framelog::T::RefreshCopyUs, over);
         } else {
             for (shadow, ranges) in self.refreshes.drain(..) {
                 for (from, to) in ranges {
@@ -11016,6 +11021,20 @@ unsafe extern "system" {
 fn direct_writes() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_DIRECT_WRITES").is_none_or(|v| v != "0"))
+}
+
+/// Writes coalesced dirty spans of one merged region. `runs` are
+/// `(offset, len)` into `merged`, placed at title address `dst`. Each run
+/// is one kernel write; the caller has already joined runs a short gap
+/// apart, so this is not one write per 4 KiB block.
+pub(crate) fn write_merged_runs(dst: usize, merged: &[u8], runs: &[(usize, usize)]) {
+    for &(off, len) in runs {
+        if len == 0 || off.saturating_add(len) > merged.len() {
+            continue;
+        }
+        crate::watch::writing(dst + off, len);
+        write_mapped((dst + off) as *mut u8, merged[off..].as_ptr(), len);
+    }
 }
 
 /// Copies host memory into title memory after a submission (what shaders

@@ -1088,7 +1088,8 @@ pub(crate) static HEAP_BUFFER_PASSES: AtomicU64 = AtomicU64::new(0);
 /// host copy and range each slot's buffer view reads. (At the module's
 /// level so that the marked pass can have this one start anew:
 /// [`State::heap_buffers_marked`].)
-type Ranges = std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
+type Ranges =
+    std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64, [u32; 3])>;
 static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, Ranges)>>> =
     std::sync::Mutex::new(None);
 /// Per host heap, for [`State::heap_buffers_marked`]: what the marked pass
@@ -2495,23 +2496,21 @@ impl State {
         }
         let started = std::time::Instant::now();
         // Per host heap: the host copy and range each slot's buffer view
-        // reads, kept from pass to pass. Only the slots written since the
-        // last pass are looked at again (83,000 slots a pass otherwise, 0.1 s
-        // at best); all of them every 16 passes, because a view of a
-        // released resource goes stale without a write, and a slot written
-        // before its memory had a host copy is only made then.
+        // reads, kept from pass to pass. Slots written since the last pass
+        // are looked at again, and one sixteenth of the rest, so sixteen
+        // passes cover every slot and no pass walks all of them. A view of
+        // a released resource goes stale without a write; its sixteenth
+        // drops it. A slot whose record is the one already stored keeps
+        // that copy (`buffer_copy` is not asked again).
         let mut kept = RANGES.lock().unwrap_or_else(|e| e.into_inner());
         let (passes, ranges) = kept
             .get_or_insert_with(Default::default)
             .entry(std::ptr::from_ref(host) as usize)
             .or_insert_with(|| (0, Ranges::new()));
         let changed = host.buffer_changes();
-        let slots = if *passes % 16 == 0 {
-            ranges.clear();
-            host.buffer_slots()
-        } else {
-            changed
-        };
+        let all = host.buffer_slots();
+        let slots = crate::laptop::heap_sweep_slots(&all, &changed, *passes);
+        let changed_now: std::collections::HashSet<u32> = changed.into_iter().collect();
         *passes += 1;
         // Whether the device was there before the pass: a view that removes
         // it is named below.
@@ -2520,10 +2519,17 @@ impl State {
             !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
         HEAP_PASS_PARTS[1].fetch_add(slots.len() as u64, Ordering::Relaxed);
         for (n, &index) in slots.iter().enumerate() {
-            ranges.remove(&index);
             let Some(handle) = heap.handle(index) else {
+                ranges.remove(&index);
                 continue;
             };
+            let record = crate::descriptor::record_at(handle);
+            if !changed_now.contains(&index)
+                && ranges.get(&index).is_some_and(|saved| saved.3 == record)
+            {
+                continue;
+            }
+            ranges.remove(&index);
             let Some(view) = host.mirror(index, handle, true) else {
                 continue;
             };
@@ -2557,7 +2563,7 @@ impl State {
             if host.shows(index, &shadow.buffer) == Some(false) {
                 HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
             }
-            ranges.insert(index, (shadow, address, address + len));
+            ranges.insert(index, (shadow, address, address + len, record));
         }
         let views = ranges.len() as u32;
         // Per host copy, the span its picked views cover.
@@ -2565,7 +2571,7 @@ impl State {
             usize,
             (std::sync::Arc<crate::shadow::Shadow>, u64, u64),
         > = std::collections::HashMap::new();
-        for (shadow, from, to) in ranges.values() {
+        for (shadow, from, to, _) in ranges.values() {
             let key = std::sync::Arc::as_ptr(shadow) as usize;
             let span = spans
                 .entry(key)

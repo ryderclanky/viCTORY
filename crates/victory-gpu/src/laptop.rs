@@ -454,8 +454,63 @@ fn merge_words(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
 }
 
 /// How a merge cuts a fetched piece before it reads title memory. An equal
-/// block is not read and not written.
+/// block is not read and not written. Also the gap under which dirty
+/// spans of one region are written back as one.
 pub(crate) const MERGE_BLOCK: usize = 4096;
+
+/// Bytes of changed runs a merge under flights may send before it settles
+/// those flights. `VICTORY_MERGE_BYTES` overrides it, from 1 byte to 8 MiB.
+pub(crate) fn merge_byte_budget(raw: Option<&str>) -> usize {
+    let n = raw
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(2 << 20);
+    n.clamp(1, 8 << 20)
+}
+
+/// Whether `runs` (offset, bytes) fit in `left`. On yes, `left` loses
+/// their bytes. On no, `left` is unchanged and the caller settles.
+pub(crate) fn take_merge_bytes(left: &mut usize, runs: &[(usize, usize)]) -> bool {
+    let bytes = runs
+        .iter()
+        .fold(0usize, |sum, run| sum.saturating_add(run.1));
+    if bytes > *left {
+        return false;
+    }
+    *left -= bytes;
+    true
+}
+
+/// The gap, in bytes, over which changed runs under flights are joined.
+/// Unset is 64. `0` keeps every run exact. Above 64 is 64.
+pub(crate) fn merge_gap_bytes(raw: Option<&str>) -> usize {
+    raw.and_then(|v| v.trim().parse::<usize>().ok())
+        .map_or(64, |n| n.min(64))
+}
+
+/// Slots a heap pass looks at besides the ones just written: one sixteenth
+/// of `slots`, `slot % 16 == pass % 16`. Sixteen passes cover every slot,
+/// and no pass is given all of them when there are more than 16.
+pub(crate) fn heap_sweep_slice(slots: &[u32], pass: u64) -> Vec<u32> {
+    let band = (pass % 16) as u32;
+    slots
+        .iter()
+        .copied()
+        .filter(|slot| slot % 16 == band)
+        .collect()
+}
+
+/// [`heap_sweep_slice`] plus `changed`, each slot once. `changed` is
+/// included even when it is not in this pass's sixteenth.
+pub(crate) fn heap_sweep_slots(slots: &[u32], changed: &[u32], pass: u64) -> Vec<u32> {
+    let mut out = heap_sweep_slice(slots, pass);
+    let mut seen: std::collections::HashSet<u32> = out.iter().copied().collect();
+    for &slot in changed {
+        if seen.insert(slot) {
+            out.push(slot);
+        }
+    }
+    out
+}
 
 /// The runs of `block` bytes where `now` differs from `was`, adjacent runs
 /// joined, as (offset, bytes). A block is one slice compare. `block` of 0
@@ -476,6 +531,24 @@ pub(crate) fn dirty_blocks(now: &[u8], was: &[u8], block: usize) -> Vec<(usize, 
             }
         }
         at += len;
+    }
+    out
+}
+
+/// Dirty runs of `now` against `was`, joined when the unchanged gap between
+/// them is at most `gap` bytes. One copy-back region is read once, merged
+/// in memory, and written back as these runs.
+pub(crate) fn coalesced_dirty(now: &[u8], was: &[u8], gap: usize) -> Vec<(usize, usize)> {
+    let runs = dirty_blocks(now, was, 64);
+    if gap == 0 || runs.len() < 2 {
+        return runs;
+    }
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(runs.len());
+    for (at, n) in runs {
+        match out.last_mut() {
+            Some(last) if at.saturating_sub(last.0 + last.1) <= gap => last.1 = at + n - last.0,
+            _ => out.push((at, n)),
+        }
     }
     out
 }
@@ -970,6 +1043,64 @@ mod tests {
         now[4096] = 1;
         assert_eq!(dirty_blocks(&now, &was, MERGE_BLOCK), [(0, 12 << 10)]);
         assert!(dirty_blocks(&now, &was, 0).is_empty());
+    }
+
+    #[test]
+    fn a_region_is_read_once_and_its_dirty_spans_are_joined() {
+        let mut now = vec![0u8; 12 << 10];
+        let was = vec![0u8; 12 << 10];
+        now[10] = 1;
+        now[100] = 3;
+        now[9000] = 2;
+        let runs = coalesced_dirty(&now, &was, MERGE_BLOCK);
+        assert_eq!(runs.len(), 2);
+        assert!(runs[0].0 <= 10 && runs[0].0 + runs[0].1 > 100);
+        assert!(runs[1].0 <= 9000 && runs[1].0 + runs[1].1 > 9000);
+        assert!(runs[0].0 + runs[0].1 <= 4096);
+        // Holes of at most one block join into one write.
+        now[4000] = 4;
+        now[8000] = 5;
+        let joined = coalesced_dirty(&now, &was, MERGE_BLOCK);
+        assert_eq!(joined.len(), 1);
+        assert_eq!(joined[0].0, 0);
+        assert!(joined[0].1 > 8000);
+    }
+
+    #[test]
+    fn a_merge_under_flights_spends_bytes_not_runs() {
+        assert_eq!(merge_byte_budget(None), 2 << 20);
+        assert_eq!(merge_byte_budget(Some("4096")), 4096);
+        assert_eq!(merge_byte_budget(Some("nope")), 2 << 20);
+        assert_eq!(merge_byte_budget(Some("999999999")), 8 << 20);
+        assert_eq!(merge_gap_bytes(None), 64);
+        assert_eq!(merge_gap_bytes(Some("0")), 0);
+        assert_eq!(merge_gap_bytes(Some("1000")), 64);
+        let mut left = merge_byte_budget(None);
+        assert!(take_merge_bytes(&mut left, &[(0, 100), (200, 50)]));
+        assert_eq!(left, (2 << 20) - 150);
+        let mut small = 100usize;
+        assert!(!take_merge_bytes(&mut small, &[(0, 40), (80, 61)]));
+        assert_eq!(small, 100);
+        assert!(take_merge_bytes(&mut small, &[(0, 100)]));
+        assert_eq!(small, 0);
+    }
+
+    #[test]
+    fn a_heap_pass_walks_one_sixteenth_and_covers_every_slot() {
+        let slots: Vec<u32> = (0..32).collect();
+        let mut seen = Vec::new();
+        for pass in 0..16 {
+            let slice = heap_sweep_slice(&slots, pass);
+            assert_eq!(slice.len(), 2);
+            assert!(slice.iter().all(|slot| slot % 16 == pass as u32));
+            let with_changed = heap_sweep_slots(&slots, &[1, 7], pass);
+            assert!(with_changed.contains(&1) && with_changed.contains(&7));
+            assert!(with_changed.len() <= slice.len() + 2);
+            seen.extend(slice);
+        }
+        seen.sort_unstable();
+        assert_eq!(seen, slots);
+        assert!(heap_sweep_slice(&slots, 16).iter().all(|s| s % 16 == 0));
         // A high bit in one byte does not change the next byte.
         let now = [0x80u8, 0, 0, 0, 0, 0, 0, 1];
         let mut held = [0u8; 8];
